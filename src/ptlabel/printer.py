@@ -15,7 +15,7 @@ from . import device
 from .render import RenderError, render_job
 from .spec import Job
 
-DEFAULT_HOST = os.environ.get("PTLABEL_PRINTER", device.PRINTER)
+DEFAULT_HOST = device.PRINTER     # PTLABEL_PRINTER; None until configured
 
 
 def separator(job: Job, model: device.Model) -> str:
@@ -115,11 +115,13 @@ class NetPrinter(Printer):
     model = device.P950NW
     key = "p950nw"
 
-    def __init__(self, host: str = DEFAULT_HOST):
+    def __init__(self, host: str | None = DEFAULT_HOST):
         self.host = host
-        self.where = host
+        self.where = host or "not configured (set PTLABEL_PRINTER)"
 
     def status(self) -> Status:
+        if not self.host:
+            raise PrinterError("no network printer address: set PTLABEL_PRINTER")
         try:
             raw = device.status(self.host)
         except Exception as e:

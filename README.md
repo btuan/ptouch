@@ -27,7 +27,7 @@ uv sync
 uv run pytest
 ```
 
-The network printer address defaults to `<printer-ip>`; set `PTLABEL_PRINTER` to change it.
+Set `PTLABEL_PRINTER` to the network printer's IP address or hostname.
 USB printers (PT-E560BT) need libusb (`brew install libusb`); they're picked up automatically.
 Choose a printer with `--printer e560bt` (CLI), `?printer=e560bt` (API) or the picker in the UI.
 Set `PTLABEL_DEFAULT_PRINTER` to change the default, `PTLABEL_USB=0` to skip USB.
@@ -118,10 +118,11 @@ edits it ("make the date bigger"). Settings: `PTLABEL_MODEL` (default `claude-op
 
 ```bash
 rsync -a --exclude .venv --exclude .git --exclude out --exclude .env --exclude data ./ user@host:ptlabel/
-ssh user@host 'cd ~/co/ptouch && docker compose up -d --build'
+ssh user@host 'cd ~/ptlabel && docker compose up -d --build'
 ```
 
-`ptlabel.env` on the host holds `ANTHROPIC_API_KEY=...` (mode 600, not in git). Templates live in
+`ptlabel.env` on the host holds `PTLABEL_PRINTER=<printer IP>` and, for Claude design,
+`ANTHROPIC_API_KEY=...` (mode 600, not in git). Templates live in
 `./data/templates` (seeded from `templates/` on first start). On Linux the fonts are Inter, Roboto
 Condensed and DejaVu Sans Mono under the same names (`sans`, `sans-condensed`, `mono`, ...), so
 label widths differ slightly from macOS. The UI is at http://<host>:8765/ and has no login:

@@ -11,6 +11,7 @@ Images here are "landscape": height = print-area pins, width = label length.
 """
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import time
@@ -18,7 +19,7 @@ from dataclasses import dataclass, replace
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-PRINTER = "<printer-ip>"
+PRINTER = os.environ.get("PTLABEL_PRINTER")   # network printer address; no default
 PORT = 9100
 HEAD_PINS = 560
 LINE_BYTES = HEAD_PINS // 8  # 70
@@ -236,9 +237,16 @@ def _snmp(host: str, *oids: str) -> list[str]:
     return [v.strip().strip('"') for v in r.stdout.splitlines()]
 
 
-def status(host: str = PRINTER) -> dict:
+def _host(host: str | None) -> str:
+    host = host or PRINTER
+    if not host:
+        raise ValueError("no network printer address: set PTLABEL_PRINTER or pass --printer <host>")
+    return host
+
+
+def status(host: str | None = None) -> dict:
     """Tape name, hrPrinterStatus, hrPrinterDetectedErrorState (standard MIBs)."""
-    tape, st, err = _snmp(host, "1.3.6.1.2.1.43.8.2.1.12.1.1",
+    tape, st, err = _snmp(_host(host), "1.3.6.1.2.1.43.8.2.1.12.1.1",
                           "1.3.6.1.2.1.25.3.5.1.1.1",
                           "1.3.6.1.2.1.25.3.5.1.2.1")
     if st.isdigit():   # no MIB files installed (e.g. Docker): snmpget prints the bare number
@@ -249,12 +257,12 @@ def status(host: str = PRINTER) -> dict:
 _HR_STATUS = {1: "other", 2: "unknown", 3: "idle", 4: "printing", 5: "warmup"}
 
 
-def send(job: bytes, host: str = PRINTER, port: int = PORT) -> None:
-    with socket.create_connection((host, port), timeout=10) as s:
+def send(job: bytes, host: str | None = None, port: int = PORT) -> None:
+    with socket.create_connection((_host(host), port), timeout=10) as s:
         s.sendall(job)
 
 
-def wait_idle(host: str = PRINTER, timeout: float = 90, settle: float = 3) -> dict:
+def wait_idle(host: str | None = None, timeout: float = 90, settle: float = 3) -> dict:
     """Poll SNMP until the printer reports idle again (the TCP port gives no replies)."""
     time.sleep(settle)
     end = time.time() + timeout

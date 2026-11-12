@@ -1,6 +1,6 @@
 # PT-P950NW raster printing — findings
 
-Printer: Brother PT-P950NW at <printer-ip>. Open: 80 (web UI), 515 (LPD), 9100 (raw).
+Printer: Brother PT-P950NW on the LAN. Open ports: 80 (web UI), 515 (LPD), 9100 (raw).
 No IPP/AirPrint. Default emulation: P-touch Template.
 
 References (official Brother developer docs; download links in `docs/README.md`):

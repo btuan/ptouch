@@ -21,9 +21,10 @@ from typing import Any
 import anthropic
 from pydantic import ValidationError
 
-from .printer import compile_job, label_length_mm
+from . import device
+from .printer import compile_job, label_length_mm, separator
 from .render import FONTS, RenderError, label_spans_mm, preview
-from .spec import TAPE_WIDTHS, Job, schemas
+from .spec import Job, schemas
 from .templates import Template
 
 log = logging.getLogger(__name__)
@@ -59,9 +60,15 @@ TOOLS = [
 ]
 
 
-def _system() -> str:
+def _system(m: device.Model) -> str:
     s = schemas()
-    return f"""You design labels for a Brother PT-P950NW label printer (360 dpi, thermal, black on white TZe tape).
+    area_12 = m.tape[12][0] / m.dpi * 25.4 if 12 in m.tape else 0
+    cuts = ("Several labels in one job are separated by half_cut (no waste) by default."
+            if m.half_cut else
+            f"The {m.name} cannot half-cut: never set separator to half_cut. Labels in one job are "
+            "separated by full cuts by default; use separator none to print them as one piece.")
+    hires = "" if m.hires else f"\n- The {m.name} has no high-resolution mode: leave hires off."
+    return f"""You design labels for a Brother {m.name} label printer ({m.dpi} dpi, thermal, TZe tape).
 
 A label is a row of items laid out along the tape; the tape width is the label's height. A Job is one
 or more labels printed as a single strip. Write specs as JSON matching these schemas exactly (unknown
@@ -74,12 +81,13 @@ Template schema (strings in `label` may contain {{{{variable}}}} placeholders):
 {json.dumps(s["Template"], separators=(",", ":"))}
 
 Facts that matter:
-- Tape widths: {list(TAPE_WIDTHS)} mm. The printable height is smaller than the tape (12 mm tape prints ~10.6 mm).
+- Tape widths this printer takes: {m.tape_widths} mm. The printable height is smaller than the tape
+  (12 mm tape prints ~{area_12:.1f} mm).{hires}
 - Fonts: {sorted(FONTS)}. Text auto-fits the tape height unless size_mm is set; multi-line text shares the height.
 - Text under ~1.8 mm tall is hard to read. QR codes need modules >= 0.2 mm; long data on narrow tape may not fit
   (use datamatrix, shorter data, or wider tape). Barcode symbologies validate their data (ean13 = 12-13 digits).
-- Tape costs money: keep labels as short as the content allows, and put several labels in one job separated
-  by half_cut rather than separate jobs. Don't add copies unless asked.
+- Tape costs money: keep labels as short as the content allows, and put several labels in one job rather
+  than separate jobs. {cuts} Don't add copies unless asked.
 - Use the tape width you're told is loaded unless the person asks otherwise.
 
 How to work:
@@ -89,13 +97,13 @@ How to work:
 4. Call submit_design with the final job and a short summary. Do not write the spec in plain text."""
 
 
-def _render(job: Job, tape: int) -> tuple[dict, bytes]:
-    data, images = compile_job(job, tape)
+def _render(job: Job, tape: int, m: device.Model) -> tuple[dict, bytes]:
+    data, images = compile_job(job, tape, m)
     buf = io.BytesIO()
-    preview(images, tape, job.hires, job.separator, job.margin_mm).save(buf, "PNG")
+    preview(images, tape, job.hires, separator(job, m), job.margin_mm, model=m).save(buf, "PNG")
     meta = {"tape_mm": tape, "labels": len(images),
-            "length_mm": round(label_length_mm(images, job), 1),
-            "label_spans_mm": label_spans_mm(images, job.hires, job.margin_mm)}
+            "length_mm": round(label_length_mm(images, job, m.dpi), 1),
+            "label_spans_mm": label_spans_mm(images, job.hires, job.margin_mm, m.dpi)}
     return meta, buf.getvalue()
 
 
@@ -122,13 +130,13 @@ def _check_template(spec: Any) -> tuple[dict | None, str | None]:
 
 
 def design(prompt: str, current: dict | None, tape_mm: int,
-           client: anthropic.Anthropic | None = None) -> Iterator[dict]:
+           client: anthropic.Anthropic | None = None, model: device.Model = device.P950NW) -> Iterator[dict]:
     """Yield progress events, ending with {"type": "done", ...} or {"type": "error", ...}."""
     if not _slots.acquire(blocking=False):
         yield {"type": "error", "msg": "The designer is busy with other requests. Try again in a moment."}
         return
     try:
-        yield from _loop(prompt, current, tape_mm, client or anthropic.Anthropic())
+        yield from _loop(prompt, current, tape_mm, client or anthropic.Anthropic(), model)
     except anthropic.AuthenticationError:
         yield {"type": "error", "msg": "The server's Claude API key was rejected."}
     except anthropic.RateLimitError:
@@ -144,12 +152,13 @@ def design(prompt: str, current: dict | None, tape_mm: int,
         _slots.release()
 
 
-def _loop(prompt: str, current: dict | None, tape_mm: int, client: anthropic.Anthropic) -> Iterator[dict]:
-    text = f"Loaded tape: {tape_mm} mm.\n\nRequest: {prompt.strip()}"
+def _loop(prompt: str, current: dict | None, tape_mm: int, client: anthropic.Anthropic,
+          m: device.Model) -> Iterator[dict]:
+    text = f"Printer: {m.name}. Loaded tape: {tape_mm} mm.\n\nRequest: {prompt.strip()}"
     if current:
         text += "\n\nCurrent design (edit this if the request is a change):\n" + json.dumps(current)
     messages: list[dict] = [{"role": "user", "content": text}]
-    system = [{"type": "text", "text": _system(), "cache_control": {"type": "ephemeral"}}]
+    system = [{"type": "text", "text": _system(m), "cache_control": {"type": "ephemeral"}}]
     renders = 0
     yield {"type": "status", "text": "Thinking about the design…"}
 
@@ -177,7 +186,7 @@ def _loop(prompt: str, current: dict | None, tape_mm: int, client: anthropic.Ant
                 err = err or terr
                 if not err:
                     try:
-                        meta, png = _render(job, job.resolved_tape(tape_mm))
+                        meta, png = _render(job, job.resolved_tape(tape_mm), m)
                     except RenderError as e:
                         err = f"Render error at {e.loc}: {e}"
                     except Exception as e:
@@ -193,7 +202,7 @@ def _loop(prompt: str, current: dict | None, tape_mm: int, client: anthropic.Ant
             elif use.name == "render_preview":
                 if not err:
                     try:
-                        meta, png = _render(job, job.resolved_tape(tape_mm))
+                        meta, png = _render(job, job.resolved_tape(tape_mm), m)
                     except RenderError as e:
                         err = f"Render error at {e.loc}: {e}"
                     except Exception as e:

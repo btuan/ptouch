@@ -14,10 +14,16 @@ class DecodedPage:
     lines: list[bytes] = field(default_factory=list)
     end: str = ""        # "FF" (more pages) or "^Z" (last page)
 
+    @property
+    def model(self) -> device.Model:
+        """Inferred from the raster line length (70 bytes = 560 pins, 16 = 128 pins)."""
+        n = len(self.lines[0]) if self.lines else device.LINE_BYTES
+        return next(m for m in device.MODELS.values() if m.line_bytes == n)
+
     def image(self) -> Image.Image:
         """Print-area image in the same orientation render.py produces (black = 0)."""
         tape = self.settings["tape_mm"]
-        start, area = device.TZE[tape][2], device.TZE[tape][1]
+        area, start = self.model.tape[tape]
         img = Image.new("1", (len(self.lines), area), 1)
         px = img.load()
         for x, line in enumerate(self.lines):
@@ -33,6 +39,7 @@ def decode(data: bytes) -> list[DecodedPage]:
     pages: list[DecodedPage] = []
     page = DecodedPage()
     compress = False
+    line_bytes = 0
     while i < n:
         b = data[i]
         if b == 0x00:
@@ -63,12 +70,13 @@ def decode(data: bytes) -> list[DecodedPage]:
         elif b == ord("Z"):
             if not compress:
                 raise ValueError(f"Z (zero raster) without TIFF compression at byte {i}")
-            page.lines.append(bytes(device.LINE_BYTES)); i += 1
+            page.lines.append(bytes(line_bytes or device.LINE_BYTES)); i += 1
         elif b == ord("G"):
             k = int.from_bytes(data[i + 1:i + 3], "little")
             body = data[i + 3:i + 3 + k]
             line = device.unpackbits(body) if compress else body
-            if len(line) != device.LINE_BYTES:
+            line_bytes = line_bytes or len(line)
+            if len(line) != line_bytes or line_bytes not in {m.line_bytes for m in device.MODELS.values()}:
                 raise ValueError(f"raster line of {len(line)} bytes at byte {i}")
             page.lines.append(line); i += 3 + k
         elif b in (0x0C, 0x1A):

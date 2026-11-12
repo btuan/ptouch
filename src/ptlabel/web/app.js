@@ -5,6 +5,7 @@ const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 
 const TOKEN_KEY = "ptlabel.token";
 const DRAFT_KEY = "ptlabel.draft.v2";
+const PRINTER_KEY = "ptlabel.printer";
 const DOTS_PER_MM = 360 / 25.4;
 const CSS_PX_PER_MM = 96 / 25.4;
 const FIT_MAX = 4;
@@ -57,15 +58,21 @@ const LABEL_FIELDS = [
   ["pad_mm", "Edge margin (mm)", "number", { def: "0.4", step: 0.1 }],
   ["border", "Border", "check"], ["invert", "Invert (white on black)", "check"],
 ];
-const JOB_FIELDS = [
-  ["separator", "Between labels", "select", { wide: true, options: ["half_cut", "full_cut", "none"],
-     labels: { half_cut: "Half-cut — backing stays, labels peel off one strip", full_cut: "Full cut — separate pieces",
-               none: "No cut — one continuous label" } }],
-  ["full_cut_every", "Also full-cut every … labels", "number", { def: "only at end", min: 1 }],
-  ["hires", "Sharper text", "check", { help: "Prints at 360×720 dpi; slower." }],
-  ["mirror", "Mirror", "check", { help: "For clear tape read from the back." }],
-  ["chain", "Don't cut after the last label", "check", { help: "Saves ~24 mm of leader on the next print; the label stays in the printer." }],
-];
+const SEP_LABELS = { half_cut: "Half-cut — backing stays, labels peel off one strip", full_cut: "Full cut — separate pieces",
+                     none: "No cut — one continuous label" };
+const jobFields = () => {
+  const p = printerInfo();
+  const seps = p.half_cut === false ? ["full_cut", "none"] : ["half_cut", "full_cut", "none"];
+  const def = p.half_cut === false ? "full_cut" : "half_cut";
+  return [
+    ["separator", "Between labels", "select", { wide: true, options: ["", ...seps],
+       labels: { "": `Printer default (${def.replace("_", "-")})`, ...SEP_LABELS } }],
+    ...(p.half_cut === false ? [] : [["full_cut_every", "Also full-cut every … labels", "number", { def: "only at end", min: 1 }]]),
+    ...(p.hires === false ? [] : [["hires", "Sharper text", "check", { help: "Prints at 360×720 dpi; slower." }]]),
+    ["mirror", "Mirror", "check", { help: "For clear tape read from the back." }],
+    ["chain", "Don't cut after the last label", "check", { help: "Saves leader tape on the next print; the label stays in the printer." }],
+  ];
+};
 
 const state = {
   job: structuredClone(DEMO),
@@ -133,6 +140,8 @@ function clean(obj) {
   return obj;
 }
 const currentJob = () => clean(structuredClone(state.job));
+const printerInfo = () => (state.meta.printers || []).find(p => p.key === state.printerKey) || {};
+const P = path => state.printerKey ? `${path}${path.includes("?") ? "&" : "?"}printer=${state.printerKey}` : path;
 const label = () => state.job.labels[state.sel.label];
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 function summary(it) {
@@ -259,7 +268,7 @@ function renderDesignInner() {
   const lf = $("#label-form"); lf.replaceChildren();
   for (const f of LABEL_FIELDS) lf.append(field(label(), f, () => { notes(); edited(); }));
   const jf = $("#job-form"); jf.replaceChildren();
-  for (const f of JOB_FIELDS) jf.append(field(state.job, f, () => { notes(); edited(); }));
+  for (const f of jobFields()) jf.append(field(state.job, f, () => { notes(); edited(); }));
   notes();
   renderStrip();
   renderActionbar();
@@ -268,7 +277,7 @@ function notes() {
   const l = label();
   const arr = { center: "Centred", start: "Left", end: "Right", between: "Spread" }[l.justify ?? "center"];
   $("#layout-note").textContent = `${arr} · ${l.length_mm ? `${l.length_mm} mm long` : "fits content"}`;
-  const sep = { half_cut: "Half-cut between", full_cut: "Full cut between", none: "No cuts between" }[state.job.separator ?? "half_cut"];
+  const sep = { half_cut: "Half-cut between", full_cut: "Full cut between", none: "No cuts between" }[state.job.separator ?? (printerInfo().half_cut === false ? "full_cut" : "half_cut")];
   $("#cut-note").textContent = `${sep} · ${state.job.chain ? "no cut at end" : "full cut at end"}${state.job.hires ? " · sharp" : ""}`;
 }
 function refreshSummaries() {
@@ -319,9 +328,11 @@ $("#del-label").onclick = () => {
 
 function renderActionbar() {
   const sel = $("#tape-select");
-  if (sel.options.length !== state.meta.tape_widths.length + 1) {
+  const widths = printerInfo().tape_widths ?? state.meta.tape_widths;
+  if (sel.dataset.widths !== String(widths)) {
+    sel.dataset.widths = String(widths);
     sel.replaceChildren(el("option", { value: "" }));
-    for (const w of state.meta.tape_widths) sel.append(el("option", { value: w }, `${w} mm`));
+    for (const w of widths) sel.append(el("option", { value: w }, `${w} mm`));
   }
   updateLoadedOption();
   if (document.activeElement !== sel) sel.value = state.job.tape_mm ?? "";
@@ -354,7 +365,7 @@ async function loadTemplates() {
     const key = `${t.name}@${state.job.tape_mm ?? "auto"}`;
     if (state.thumbs[key]) { img.src = state.thumbs[key]; continue; }
     const vars = Object.fromEntries(Object.entries(t.variables).map(([k, v]) => [k, v.example ?? v.default ?? k]));
-    api(`/templates/${t.name}/render?format=json&frame=false`, { method: "POST",
+    api(P(`/templates/${t.name}/render?format=json&frame=false`), { method: "POST",
       body: JSON.stringify({ vars, job: clean({ tape_mm: state.job.tape_mm }) }) })
       .then(r => (img.src = state.thumbs[key] = `data:image/png;base64,${r.preview_png_base64}`)).catch(() => {});
   }
@@ -512,7 +523,7 @@ async function refreshPreview() {
   const my = ++seq;
   $("#preview").classList.add("busy");
   try {
-    const r = await api("/render?format=json&frame=false", { method: "POST", body: JSON.stringify(currentJob()) });
+    const r = await api(P("/render?format=json&frame=false"), { method: "POST", body: JSON.stringify(currentJob()) });
     if (my !== seq) return;
     state.render = { png: r.preview_png_base64, tape_mm: r.tape_mm, labels: r.labels, length_mm: r.length_mm,
                      spans: r.label_spans_mm,
@@ -630,7 +641,7 @@ $("#confirm-go").onclick = async () => {
   if (sent !== JSON.stringify(currentJob())) return toast("The label changed; check the preview and print again.", { bad: true });
   const btn = $("#print"); btn.disabled = true; btn.textContent = "Printing…";
   try {
-    const r = await api("/print", { method: "POST", body: sent });
+    const r = await api(P("/print"), { method: "POST", body: sent });
     toast(`Printed ${plural(r.labels, "label")} (${r.length_mm} mm)`);
   } catch (e) { toast(`Print failed: ${e.message}`, { bad: true }); }
   finally { syncPrintButton(); refreshPrinter(); }
@@ -669,7 +680,7 @@ $("#ai").onsubmit = async e => {
   const tape = state.printer?.tape_mm ?? state.job.tape_mm ?? null;
   let finished = false;
   try {
-    for await (const ev of sse("/design", { prompt, job: currentJob(), tape_mm: tape })) {
+    for await (const ev of sse("/design", { prompt, job: currentJob(), tape_mm: tape, printer: state.printerKey })) {
       if (ev.type === "status") status.textContent = ev.text;
       else if (ev.type === "preview") { draft.src = `data:image/png;base64,${ev.preview_png_base64}`; draft.hidden = false; }
       else if (ev.type === "error") { status.textContent = ev.msg; status.className = "ai-status bad"; finished = true; }
@@ -717,7 +728,9 @@ async function refreshPrinter() {
   const box = $("#printer");
   $("#printer-retry").hidden = true;
   try {
-    const s = await api("/printer/status");
+    const key = state.printerKey;
+    const s = await api(P("/printer/status"));
+    if (key !== state.printerKey) return;     // switched printers while waiting
     state.printer = s;
     box.className = "printer " + (s.ok ? "ok" : "warn");
     const words = s.problems?.length ? s.problems.join(", ") : (STATE_WORDS[s.state] ?? s.state);
@@ -725,7 +738,8 @@ async function refreshPrinter() {
   } catch (e) {
     state.printer = null;
     box.className = "printer bad";
-    $("#printer-text").textContent = e instanceof NetError ? "Can't reach ptlabel server" : "Printer offline";
+    $("#printer-text").textContent = e instanceof NetError ? "Can't reach ptlabel server"
+      : printerInfo().connection === "USB" ? "Not connected" : "Printer offline";
     $("#printer").title = e.message;
     $("#printer-retry").hidden = false;
   }
@@ -739,6 +753,25 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 (async () => {
   try { const d = JSON.parse(localStorage.getItem(DRAFT_KEY)); if (d?.labels?.length) state.job = d; } catch {}
   try { state.meta = await api("/meta"); } catch (e) { toast(e.message, { bad: true }); }
+  const ps = state.meta.printers || [];
+  let saved = null; try { saved = localStorage.getItem(PRINTER_KEY); } catch {}
+  state.printerKey = ps.some(p => p.key === saved) ? saved : ps[0]?.key ?? null;
+  const pick = $("#printer-pick");
+  pick.replaceChildren(...ps.map(p => el("option", { value: p.key }, `${p.name} · ${p.connection === "USB" ? "USB" : "network"}`)));
+  pick.value = state.printerKey ?? "";
+  pick.hidden = ps.length < 2;
+  pick.onchange = () => {
+    state.printerKey = pick.value;
+    try { localStorage.setItem(PRINTER_KEY, pick.value); } catch {}
+    state.printer = null; state.thumbs = {};
+    $("#printer-text").textContent = "Checking printer…"; $("#printer").className = "printer";
+    const p = printerInfo();
+    if (state.job.tape_mm && p.tape_widths && !p.tape_widths.includes(state.job.tape_mm)) delete state.job.tape_mm;
+    if (p.half_cut === false && state.job.separator === "half_cut") delete state.job.separator;
+    if (p.hires === false) delete state.job.hires;
+    renderDesign(); renderActionbar(); edited(); refreshPrinter();
+    if (state.tab === "template") loadTemplates().catch(() => {});
+  };
   if (state.meta.design) {
     $("#ai").hidden = false;
     $("#ai-model").textContent = "with Claude · ⌘↵";

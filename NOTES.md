@@ -28,3 +28,22 @@ References (official Brother developer docs; download links in `docs/README.md`)
 
 Put many labels in **one job** with half-cuts between them and a full cut at the end
 (or `cut_every=N`). Each separate job costs a full cut plus padding to ~22 mm.
+
+## PT-E560BT (USB)
+
+No Brother manual covers it; command details come from the ptouch-print driver
+(`04f9:2203`, flags P700_INIT | USE_INFO_CMD | D460BT_MAGIC) and were checked on 12 mm tape
+on 2026-11-12.
+
+| Finding | Detail |
+|---|---|
+| Head | 128 pins, 180 dpi; 16-byte raster lines; uncompressed (`M 00`) |
+| Print area | Centred: 12 mm = 70 pins from pin 29 (6/9/18/24 mm from the P750W table, untested) |
+| Scale | 30 mm drawn = 30 mm on tape |
+| Commands | The P950NW header (`ESC i a/z/M/A/K/d`, `FF` between pages, `^Z` at end) works as-is |
+| Cut every N | `ESC i A 2` with half-cut on: half-cut after label 1, full cut after label 2 |
+| One-page jobs | Must set `ESC i z` n9 = 2 (last page). With 0 it prints, then stays on "Printing... please wait" and stops answering USB until power-cycled |
+| Status | Answers `ESC i S` with the standard 32-byte block (tape width, media, colours, errors). Sends **no** "printing completed" messages: wait, then ask |
+| After a cut | The next label starts ~10 mm after the cut (cutter-to-head distance) |
+| Half-cut | Works (`ESC i K` bit 2), confirmed on tape, though ptouch-print doesn't offer it. Default between labels, as on the P950NW |
+| High-res | Not supported |

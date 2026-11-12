@@ -21,7 +21,9 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from .printer import Printer, PrinterError, compile_job, label_length_mm
+from .device import P950NW
+from .printer import (Printer, PrinterError, compile_job, default_printers, get_printer,
+                      label_length_mm, separator)
 from .render import RenderError, preview
 from .spec import Job, Label, schemas
 from .templates import TemplateStore
@@ -49,20 +51,21 @@ def resolve_tape(job: Job, printer: Printer | None, fallback: int = 12) -> int:
 
 def do_render(job: Job, out: str, printer: Printer | None) -> dict:
     tape = resolve_tape(job, printer)
-    data, images = compile_job(job, tape)
-    preview(images, tape, job.hires, job.separator, job.margin_mm).save(out)
-    return {"preview": out, "tape_mm": tape, "labels": len(images), "bytes": len(data),
-            "length_mm": round(label_length_mm(images, job), 1)}
+    model = printer.model if printer else P950NW
+    data, images = compile_job(job, tape, model)
+    preview(images, tape, job.hires, separator(job, model), job.margin_mm, model=model).save(out)
+    return {"preview": out, "printer": model.key, "tape_mm": tape, "labels": len(images), "bytes": len(data),
+            "length_mm": round(label_length_mm(images, job, model.dpi), 1)}
 
 
 def do_print(job: Job, printer: Printer, dry_run: bool, bin_out: str | None) -> dict:
     if dry_run:
         tape = resolve_tape(job, printer)
-        data, images = compile_job(job, tape)
+        data, images = compile_job(job, tape, printer.model)
         if bin_out:
             Path(bin_out).write_bytes(data)
-        return {"dry_run": True, "tape_mm": tape, "labels": len(images), "bytes": len(data),
-                "length_mm": round(label_length_mm(images, job), 1)}
+        return {"dry_run": True, "printer": printer.model.key, "tape_mm": tape, "labels": len(images),
+                "bytes": len(data), "length_mm": round(label_length_mm(images, job, printer.model.dpi), 1)}
     return printer.print(job)
 
 
@@ -85,10 +88,13 @@ def _rows(path: str | None, single: dict) -> list[dict]:
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="ptlabel", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--printer", default=None, help="printer host (env PTLABEL_PRINTER)")
+    ap.add_argument("--printer", "-p", default=None,
+                    help="p950nw (network, default) | e560bt (USB) | a network printer host "
+                         "(env PTLABEL_DEFAULT_PRINTER)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status")
+    sub.add_parser("printers")
     p = sub.add_parser("schema"); p.add_argument("which", nargs="?", choices=["Label", "Job", "Template"])
     p = sub.add_parser("render"); p.add_argument("spec"); p.add_argument("-o", "--out", default="label.png")
     p.add_argument("--tape", type=int)
@@ -115,7 +121,7 @@ def main(argv=None):
             p.add_argument("--dry-run", action="store_true")
 
     a = ap.parse_args(argv)
-    printer = Printer(a.printer) if a.printer else Printer()
+    printer = get_printer(a.printer)
     try:
         result = _run(a, printer)
     except (ValidationError, RenderError, PrinterError, ValueError, KeyError, OSError) as e:
@@ -128,6 +134,15 @@ def main(argv=None):
 def _run(a, printer: Printer):
     if a.cmd == "status":
         return printer.status().as_dict()
+    if a.cmd == "printers":
+        out = []
+        for p in default_printers().values():
+            try:
+                st = p.status().as_dict()
+            except PrinterError as e:
+                st = {"error": str(e)}
+            out.append(p.describe() | {"status": st})
+        return out
     if a.cmd == "schema":
         s = schemas()
         return s[a.which] if a.which else s
@@ -144,7 +159,7 @@ def _run(a, printer: Printer):
         pages = decode(Path(a.bin).read_bytes())
         imgs = [p.image() for p in pages]
         s0 = pages[0].settings
-        preview(imgs, s0["tape_mm"], s0.get("hires", False)).save(a.out)
+        preview(imgs, s0["tape_mm"], s0.get("hires", False), model=pages[0].model).save(a.out)
         return {"pages": [p.settings | {"end": p.end} for p in pages], "preview": a.out}
     if a.cmd == "serve":
         import uvicorn

@@ -1,7 +1,7 @@
 # ptlabel
 
-Design and print labels on a Brother PT-P950NW over the network, from code, a CLI,
-or an HTTP API. Labels are plain JSON, so coding agents (and later an LLM-backed web UI)
+Design and print labels on Brother P-touch printers (PT-P950NW over the network, PT-E560BT
+over USB), from code, a CLI, or an HTTP API. Labels are plain JSON, so coding agents (and later an LLM-backed web UI)
 can compose them without touching printer internals.
 
 ```
@@ -27,7 +27,10 @@ uv sync
 uv run pytest
 ```
 
-The printer address defaults to `<printer-ip>`; set `PTLABEL_PRINTER` to change it.
+The network printer address defaults to `<printer-ip>`; set `PTLABEL_PRINTER` to change it.
+USB printers (PT-E560BT) need libusb (`brew install libusb`); they're picked up automatically.
+Choose a printer with `--printer e560bt` (CLI), `?printer=e560bt` (API) or the picker in the UI.
+Set `PTLABEL_DEFAULT_PRINTER` to change the default, `PTLABEL_USB=0` to skip USB.
 Fonts default to macOS system fonts (SF Pro / SF Mono).
 
 ## Label spec
@@ -94,7 +97,8 @@ to require `Authorization: Bearer <token>`.
 | Method | Path | |
 |---|---|---|
 | GET | `/schema` | JSON Schemas for Label, Job, Template |
-| GET | `/printer/status` | tape, state, errors |
+| GET | `/printers` | printers available, with dpi, tape widths, half-cut/hi-res support |
+| GET | `/printer/status` | tape, state, errors (`?printer=` on this and every render/print route) |
 | POST | `/render?format=png\|json` | Job or Label → preview |
 | POST | `/print?dry_run=` | Job or Label → printer |
 | GET/PUT/DELETE | `/templates/{name}` | manage templates |

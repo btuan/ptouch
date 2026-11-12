@@ -10,6 +10,7 @@ import base64
 import io
 import math
 import os
+from contextvars import ContextVar
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -60,8 +61,12 @@ class RenderError(ValueError):
         self.loc = loc or []
 
 
+# Print resolution of the printer being rendered for (set by render_label for its duration).
+_dpi: ContextVar[int] = ContextVar("dpi", default=DPI)
+
+
 def dpmm(scale: int = 1) -> float:
-    return DPI / 25.4 * scale
+    return _dpi.get() / 25.4 * scale
 
 
 def _font(name: str, px: int) -> ImageFont.FreeTypeFont:
@@ -182,7 +187,7 @@ def _barcode(it: Barcode, h: int, s: int) -> Image.Image:
     except Exception as e:  # python-barcode raises several types for bad data
         raise RenderError(f"invalid {it.symbology} data {it.data!r}: {e}") from e
     pattern = bc.build()[0]
-    m = max(1, round(it.module_mm * DPI / 25.4)) * s     # along the feed axis
+    m = max(1, round(it.module_mm * dpmm())) * s     # along the feed axis
     quiet = 10 * m
     avail = int(h * it.height_pct / 100)
     text_h = int(avail * 0.24) if it.show_text else 0
@@ -250,13 +255,24 @@ def _item(it, h: int, s: int) -> Image.Image:
 
 # ------------------------------------------------------------------ label
 
-def render_label(label: Label, tape_mm: int, hires: bool = False) -> Image.Image:
+def render_label(label: Label, tape_mm: int, hires: bool = False,
+                 model: device.Model = device.P950NW) -> Image.Image:
     """Return a mode "1" image: height = print-area dots, width = feed dots
-    (720 dpi along the feed when hires)."""
-    if tape_mm not in device.TZE:
-        raise RenderError(f"unsupported tape {tape_mm} mm")
+    (twice the dpi along the feed when hires)."""
+    if tape_mm not in model.tape:
+        raise RenderError(f"{model.name} can't use {tape_mm} mm tape (supports {model.tape_widths} mm)")
+    if hires and not model.hires:
+        raise RenderError(f"{model.name} has no high-resolution mode; turn hires off")
+    token = _dpi.set(model.dpi)
+    try:
+        return _render_label(label, tape_mm, hires, model)
+    finally:
+        _dpi.reset(token)
+
+
+def _render_label(label: Label, tape_mm: int, hires: bool, model: device.Model) -> Image.Image:
     s = 2 if hires else 1
-    area = device.TZE[tape_mm][1]
+    area = model.tape[tape_mm][0]
     H = area * s
     pad = round(label.pad_mm * dpmm(s))
     inner = H - 2 * pad
@@ -296,21 +312,23 @@ def render_label(label: Label, tape_mm: int, hires: bool = False) -> Image.Image
     return img.point(lambda v: 255 if v >= 128 else 0).convert("1")
 
 
-def label_spans_mm(images: list[Image.Image], hires: bool, margin_mm: float) -> list[tuple[float, float]]:
+def label_spans_mm(images: list[Image.Image], hires: bool, margin_mm: float,
+                   dpi: int = DPI) -> list[tuple[float, float]]:
     """(start, end) of each label along the preview strip, in mm, incl. its feed margins."""
     spans, x = [], 0.0
+    per_mm = dpi / 25.4
     for im in images:
-        w = im.width / (720 if hires else DPI) * 25.4 + 2 * round(margin_mm * dpmm()) / dpmm()
+        w = im.width / (dpi * (2 if hires else 1)) * 25.4 + 2 * round(margin_mm * per_mm) / per_mm
         spans.append((round(x, 2), round(x + w, 2)))
         x += w
     return spans
 
 
-def render_job(job: Job, tape_mm: int) -> list[Image.Image]:
+def render_job(job: Job, tape_mm: int, model: device.Model = device.P950NW) -> list[Image.Image]:
     out = []
     for i, l in enumerate(job.labels):
         try:
-            img = render_label(l, tape_mm, job.hires)
+            img = render_label(l, tape_mm, job.hires, model)
         except RenderError as e:
             raise RenderError(str(e), ["labels", i, *e.loc]) from e
         out += [img] * job.copies
@@ -321,10 +339,19 @@ def render_job(job: Job, tape_mm: int) -> list[Image.Image]:
 
 def preview(images: list[Image.Image], tape_mm: int, hires: bool = False,
             separator: str = "half_cut", margin_mm: float = 1.0, scale: int = 2,
-            frame: bool = True) -> Image.Image:
-    """Human-viewable RGB preview: labels on a strip of tape with cut marks."""
-    tape_h, off = TAPE_DOTS[tape_mm]
-    m = round(margin_mm * dpmm())
+            frame: bool = True, model: device.Model = device.P950NW) -> Image.Image:
+    """Human-viewable RGB preview: labels on a strip of tape with cut marks.
+
+    Drawn at the printer's dpi; 180 dpi printers are shown at double scale so a
+    preview is the same physical size for every model."""
+    if model.dpi == DPI:
+        tape_h, off = TAPE_DOTS[tape_mm]
+    else:
+        tape_h = round(tape_mm * model.dpi / 25.4)
+        off = max(0, (tape_h - model.tape[tape_mm][0]) // 2)
+        tape_h = max(tape_h, model.tape[tape_mm][0])
+        scale = scale * DPI // model.dpi
+    m = round(margin_mm * model.dpi / 25.4)
     imgs = [i.resize((i.width // 2, i.height)) if hires else i for i in images]
     W = sum(i.width + 2 * m for i in imgs)
     strip = Image.new("RGB", (W, tape_h), (250, 250, 247))

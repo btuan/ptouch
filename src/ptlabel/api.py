@@ -24,7 +24,8 @@ import json
 from . import __doc__ as pkg_doc
 from . import design as designer
 from .cli import resolve_tape
-from .printer import Printer, PrinterError, compile_job, label_length_mm
+from .printer import (Printer, PrinterError, compile_job, default_printers, get_printer,
+                      label_length_mm, separator)
 from .render import FONTS, RenderError, label_spans_mm, preview
 from .spec import TAPE_WIDTHS, Job, Label, schemas
 from .templates import Template, TemplateStore
@@ -39,7 +40,18 @@ def _auth(authorization: str | None = Header(None)):
 app = FastAPI(title="ptlabel", description=pkg_doc, version="0.1.0")
 api = APIRouter(dependencies=[Depends(_auth)])
 WEB = Path(__file__).parent / "web"
-printer = Printer()
+printers: dict[str, Printer] = default_printers()
+printer = printers["p950nw"]          # default; tests patch this one
+
+
+def pick(key: str | None) -> Printer:
+    if key is None:
+        return printer
+    if key not in printers:
+        raise HTTPException(404, f"no printer {key!r}; have {sorted(printers)}")
+    return printers[key]
+
+
 store = TemplateStore(os.environ.get("PTLABEL_TEMPLATES") or TemplateStore().root)
 
 
@@ -55,30 +67,35 @@ def _render_http(e: RenderError) -> HTTPException:
     return HTTPException(422, [{"loc": ["body", *e.loc], "msg": str(e), "type": "render_error"}])
 
 
-def _render(job: Job, fmt: str, frame: bool = True):
+def _render(job: Job, fmt: str, frame: bool = True, p: Printer | None = None):
+    p = p or printer
+    m = p.model
     try:
-        tape = resolve_tape(job, printer)
-        data, images = compile_job(job, tape)
+        tape = resolve_tape(job, p)
+        data, images = compile_job(job, tape, m)
     except RenderError as e:
         raise _render_http(e) from e
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
     buf = io.BytesIO()
-    preview(images, tape, job.hires, job.separator, job.margin_mm, frame=frame).save(buf, "PNG")
-    meta = {"tape_mm": tape, "labels": len(images), "bytes": len(data),
-            "label_spans_mm": label_spans_mm(images, job.hires, job.margin_mm),
-            "length_mm": round(label_length_mm(images, job), 1)}
+    preview(images, tape, job.hires, separator(job, m), job.margin_mm, frame=frame, model=m).save(buf, "PNG")
+    meta = {"printer": p.key, "tape_mm": tape, "labels": len(images), "bytes": len(data),
+            "label_spans_mm": label_spans_mm(images, job.hires, job.margin_mm, m.dpi),
+            "length_mm": round(label_length_mm(images, job, m.dpi), 1)}
     if fmt == "json":
         return meta | {"preview_png_base64": base64.b64encode(buf.getvalue()).decode()}
     return Response(buf.getvalue(), media_type="image/png",
                     headers={f"X-Label-{k.replace('_', '-')}": str(v) for k, v in meta.items()})
 
 
-def _print(job: Job, dry_run: bool):
+def _print(job: Job, dry_run: bool, p: Printer | None = None):
+    p = p or printer
     if dry_run:
-        r = _render(job, "json")
+        r = _render(job, "json", p=p)
         r.pop("preview_png_base64")
         return r | {"dry_run": True}
     try:
-        return printer.print(job)
+        return p.print(job)
     except RenderError as e:
         raise _render_http(e) from e
     except PrinterError as e:
@@ -93,25 +110,33 @@ def get_schema():
     return schemas()
 
 
+@api.get("/printers")
+def list_printers():
+    """Printers this server can use, with what each supports. Status is per printer."""
+    return [p.describe() for p in printers.values()]
+
+
 @api.get("/printer/status")
-def get_status():
+def get_status(printer_key: str | None = Query(None, alias="printer")):
+    p = pick(printer_key)
     try:
-        return printer.status().as_dict() | {"host": printer.host}
+        return p.status().as_dict() | {"printer": p.key, "connection": p.where}
     except PrinterError as e:
         raise HTTPException(503, str(e)) from e
 
 
 @api.post("/render", responses={200: {"content": {"image/png": {}}}})
 def render(spec: dict[str, Any], format: str = Query("png", pattern="^(png|json)$"),
-           frame: bool = True):
+           frame: bool = True, printer_key: str | None = Query(None, alias="printer")):
     """Render a Job or Label to a preview (PNG, or JSON with base64 PNG + metadata)."""
-    return _render(as_job(spec), format, frame)
+    return _render(as_job(spec), format, frame, pick(printer_key))
 
 
 @api.post("/print")
-def print_(spec: dict[str, Any], dry_run: bool = False):
+def print_(spec: dict[str, Any], dry_run: bool = False,
+           printer_key: str | None = Query(None, alias="printer")):
     """Print a Job or Label. Checks the loaded tape matches first."""
-    return _print(as_job(spec), dry_run)
+    return _print(as_job(spec), dry_run, pick(printer_key))
 
 
 class Fill(BaseModel):
@@ -167,13 +192,14 @@ def delete_template(name: str):
 
 @api.post("/templates/{name}/render", responses={200: {"content": {"image/png": {}}}})
 def render_template(name: str, fill: Fill, format: str = Query("png", pattern="^(png|json)$"),
-                    frame: bool = True):
-    return _render(fill.to_job(_get(name)), format, frame)
+                    frame: bool = True, printer_key: str | None = Query(None, alias="printer")):
+    return _render(fill.to_job(_get(name)), format, frame, pick(printer_key))
 
 
 @api.post("/templates/{name}/print")
-def print_template(name: str, fill: Fill, dry_run: bool = False):
-    return _print(fill.to_job(_get(name)), dry_run)
+def print_template(name: str, fill: Fill, dry_run: bool = False,
+                   printer_key: str | None = Query(None, alias="printer")):
+    return _print(fill.to_job(_get(name)), dry_run, pick(printer_key))
 
 
 @api.get("/meta")
@@ -181,13 +207,15 @@ def meta():
     """Choices for building UIs: fonts, tape widths, item types."""
     return {"fonts": sorted(FONTS), "tape_widths": list(TAPE_WIDTHS),
             "item_types": ["text", "qr", "datamatrix", "barcode", "image", "spacer", "rule"],
-            "printer": printer.host, "design": designer.available(), "design_model": designer.MODEL}
+            "printer": printer.host, "printers": [p.describe() for p in printers.values()],
+            "design": designer.available(), "design_model": designer.MODEL}
 
 
 class DesignRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
     job: dict[str, Any] | None = Field(None, description="Current design to edit, if any.")
     tape_mm: int | None = Field(None, description="Tape to design for; default: loaded tape.")
+    printer: str | None = Field(None, description="Printer key to design for (resolution, tapes, cuts).")
 
 
 @api.post("/design")
@@ -199,16 +227,17 @@ def design(req: DesignRequest):
     """
     if not designer.available():
         raise HTTPException(503, "generative design is not configured (no ANTHROPIC_API_KEY)")
+    p = pick(req.printer)
     tape = req.tape_mm
     if tape is None:
         try:
-            tape = printer.status().tape_mm
+            tape = p.status().tape_mm
         except PrinterError:
             pass
     tape = tape or 12
 
     def events():
-        for ev in designer.design(req.prompt, req.job, tape):
+        for ev in designer.design(req.prompt, req.job, tape, model=p.model):
             yield f"data: {json.dumps(ev)}\n\n"
     return StreamingResponse(events(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

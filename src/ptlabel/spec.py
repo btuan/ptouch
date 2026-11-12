@@ -112,7 +112,9 @@ class Job(BaseModel):
     labels: list[Label] = Field(min_length=1)
     tape_mm: int | None = Field(None, description="Default tape width for labels; omit to auto-detect.")
     copies: int = Field(1, ge=1, le=100)
-    separator: Literal["half_cut", "full_cut", "none"] = "half_cut"
+    separator: Literal["half_cut", "full_cut", "none"] | None = Field(
+        None, description="Between labels. Default: half_cut where the printer supports it, "
+                          "else full_cut.")
     full_cut_every: int | None = Field(None, ge=1, le=255,
                                        description="With half_cut: also full-cut every N labels.")
     chain: bool = Field(False, description="Leave the last label in the printer (no feed/cut).")

@@ -1,0 +1,15 @@
+{
+  "name": "asset-tag",
+  "description": "QR code linking to the asset page, with the asset ID and a location line.",
+  "variables": {
+    "id": {"description": "Asset ID", "example": "A-00123"},
+    "location": {"description": "Where it lives", "default": "", "example": "Lab / Rack B"},
+    "url_base": {"description": "Prefix for the QR link", "default": "https://example.com/asset/"}
+  },
+  "label": {
+    "items": [
+      {"type": "qr", "data": "{{url_base}}{{id}}"},
+      {"type": "text", "text": "{{id}}\n{{location}}", "font": "sans-bold"}
+    ]
+  }
+}

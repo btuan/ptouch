@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ptlabel</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><svg class="mark" viewBox="0 0 24 14" aria-hidden="true"><rect x="1" y="1" width="22" height="12" rx="1.5"/><path d="M9 1v12" stroke-dasharray="2 2"/></svg>ptlabel</div>
+  <div class="top-right">
+    <button class="btn ghost sm" id="new-job" title="Clear and start a new label">New</button>
+    <button class="btn ghost sm" id="spec-open" aria-haspopup="dialog" title="View or edit the job as JSON">{ } Spec</button>
+    <div id="printer" class="printer" role="status">
+      <span class="dot"></span><span id="printer-text">Checking printer…</span>
+      <button class="link" id="printer-retry" hidden>Retry</button>
+    </div>
+  </div>
+</header>
+
+<main class="layout">
+  <aside class="editor" aria-label="Editor">
+    <div class="tabs" role="tablist" aria-label="Editor mode">
+      <button role="tab" id="tab-design" aria-controls="panel-design" data-tab="design" aria-selected="true">Design</button>
+      <button role="tab" id="tab-template" aria-controls="panel-template" data-tab="template" aria-selected="false" tabindex="-1">Templates</button>
+    </div>
+
+    <section class="panel" id="panel-design" role="tabpanel" aria-labelledby="tab-design">
+      <form class="card ai" id="ai" hidden>
+        <label for="ai-prompt" class="ai-h">Describe a label <span class="h-note" id="ai-model"></span></label>
+        <textarea id="ai-prompt" rows="2" maxlength="4000" placeholder="e.g. cable labels for HDMI 1–4, or “make the text bigger”"></textarea>
+        <div class="ai-row">
+          <span class="ai-status" id="ai-status" aria-live="polite"></span>
+          <button class="btn primary" id="ai-go" type="submit">Design</button>
+        </div>
+        <img id="ai-draft" class="ai-draft" alt="Latest draft" hidden>
+        <div class="ai-result" id="ai-result" hidden>
+          <p id="ai-summary"></p>
+          <button class="btn sm" id="ai-save-tpl" type="button" hidden></button>
+        </div>
+      </form>
+
+      <div class="section">
+        <h2 id="items-h">Items on <span id="items-label-name">the label</span> <span class="h-note">left to right</span></h2>
+        <ul id="items" class="items" aria-labelledby="items-h"></ul>
+        <div class="add-items" id="add-items" role="group" aria-label="Add item"></div>
+      </div>
+
+      <div class="card" id="item-card">
+        <div class="card-head"><h3 id="item-card-title">Text</h3></div>
+        <div id="item-form" class="form"></div>
+      </div>
+
+      <details class="section" id="layout-section">
+        <summary><h2>Arrangement</h2><span class="summary-note" id="layout-note"></span></summary>
+        <div id="label-form" class="form"></div>
+      </details>
+
+      <details class="section" id="cut-section">
+        <summary><h2>Cutting &amp; quality</h2><span class="summary-note" id="cut-note"></span></summary>
+        <div id="job-form" class="form"></div>
+      </details>
+
+      <details class="section">
+        <summary><h2>Save as template</h2></summary>
+        <p class="hint">Type <code>{{name}}</code> in any text or data field to turn it into a fill-in variable.</p>
+        <div class="form">
+          <label class="field"><span>Name</span><input id="save-name" placeholder="cable-tag" autocomplete="off"></label>
+          <label class="field"><span>Description</span><input id="save-desc" autocomplete="off"></label>
+        </div>
+        <button class="btn" id="save-tpl">Save current label</button>
+      </details>
+    </section>
+
+    <section class="panel" id="panel-template" role="tabpanel" aria-labelledby="tab-template" hidden>
+      <div class="section">
+        <h2>Templates</h2>
+        <div id="tpl-grid" class="tpl-grid"></div>
+      </div>
+      <div class="card" id="tpl-card" hidden>
+        <div class="card-head"><h3 id="tpl-title"></h3></div>
+        <p id="tpl-desc" class="hint"></p>
+        <div id="tpl-vars" class="form"></div>
+        <details class="batch">
+          <summary>Batch: one label per row</summary>
+          <p class="hint">Paste from a spreadsheet or CSV. The first row names the columns: <code id="tpl-cols"></code></p>
+          <textarea id="tpl-rows" rows="5" spellcheck="false"></textarea>
+        </details>
+        <p class="rowcheck" id="tpl-rowcount" aria-live="polite"></p>
+        <div class="btn-row">
+          <button class="btn primary" id="tpl-replace">Replace job</button>
+          <button class="btn" id="tpl-add">Add to job</button>
+        </div>
+      </div>
+    </section>
+  </aside>
+
+  <section class="stage" aria-label="Preview and print">
+    <div class="strip-bar">
+      <div id="label-strip" class="label-strip" role="toolbar" aria-label="Labels in this print job"></div>
+      <div class="btn-row strip-tools">
+        <button class="btn ghost sm" id="dup-label">Duplicate label</button>
+        <button class="btn ghost sm" id="del-label">Delete label</button>
+      </div>
+    </div>
+
+    <div class="preview-box">
+      <div class="zoom" role="group" aria-label="Zoom">
+        <button data-zoom="fit" aria-pressed="true" title="Fit to the window (up to 4×)">Fit</button>
+        <button data-zoom="1" aria-pressed="false" title="About real size on most screens">1:1</button>
+        <button data-zoom="2" aria-pressed="false">2×</button>
+        <button data-zoom="4" aria-pressed="false">4×</button>
+      </div>
+      <div class="preview-wrap" id="preview-wrap">
+        <div class="preview" id="preview">
+          <div class="tape" id="tape"><img id="preview-img" alt=""><div class="hl" id="hl" hidden></div></div>
+          <div class="ruler" id="ruler" aria-hidden="true"></div>
+          <div class="skeleton" id="skeleton"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="error" class="error" role="alert" hidden></div>
+    <p class="stats" id="stats" aria-live="polite">Rendering…</p>
+    <p class="source" id="source" hidden></p>
+    <div class="banner" id="tape-warn" role="alert" hidden>
+      <span id="tape-warn-text"></span>
+      <button class="btn sm" id="tape-warn-fix"></button>
+    </div>
+
+    <div class="actionbar">
+      <label class="inline"><span class="lbl">Tape</span> <select id="tape-select" aria-label="Tape width"></select></label>
+      <label class="inline"><span class="lbl">Copies</span><span class="x" aria-hidden="true">×</span> <input id="copies" aria-label="Copies" type="number" min="1" max="100" value="1" inputmode="numeric"></label>
+      <span class="spacer"></span>
+      <button class="btn ghost icon" id="download" title="Download preview PNG" aria-label="Download preview PNG">⤓</button>
+      <div class="print-wrap">
+        <button class="btn primary" id="print">Print</button>
+        <div class="confirm" id="confirm" hidden role="dialog" aria-label="Confirm print">
+          <p id="confirm-text"></p>
+          <p id="confirm-warn" class="confirm-warn" hidden></p>
+          <div class="btn-row">
+            <button class="btn ghost" id="confirm-cancel">Cancel</button>
+            <button class="btn primary" id="confirm-go">Print</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<dialog id="spec" class="drawer" aria-label="Job spec">
+  <div class="drawer-head">
+    <h2>Job spec (JSON)</h2>
+    <button class="btn ghost sm" id="spec-close" aria-label="Close">✕</button>
+  </div>
+  <p class="hint">Exactly what gets sent to the printer. Scripts and agents can POST this to <code>/render</code> or <code>/print</code>. <a href="/schema" target="_blank">Schema</a> · <a href="/docs" target="_blank">API docs</a></p>
+  <textarea id="json" spellcheck="false"></textarea>
+  <div class="btn-row">
+    <button class="btn primary" id="json-apply">Apply</button>
+    <button class="btn" id="json-copy">Copy</button>
+  </div>
+</dialog>
+
+<div id="toast" class="toast" hidden>
+  <span id="toast-text"></span>
+  <button class="link" id="toast-action" hidden></button>
+  <button class="toast-close" id="toast-close" aria-label="Dismiss" hidden>✕</button>
+</div>
+<script src="/static/app.js" type="module"></script>
+</body>
+</html>

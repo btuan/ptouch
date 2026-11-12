@@ -1,0 +1,12 @@
+services:
+  ptlabel:
+    build: .
+    image: ptlabel:latest
+    container_name: ptlabel
+    restart: unless-stopped
+    ports: ["8765:8765"]
+    env_file: [ptlabel.env]          # ANTHROPIC_API_KEY=..., optional PTLABEL_* overrides
+    environment:
+      PTLABEL_PRINTER: <printer-ip>
+    volumes: ["./data:/data"]
+    mem_limit: 300m

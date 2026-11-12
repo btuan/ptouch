@@ -1,0 +1,30 @@
+{
+  "name": "cable",
+  "description": "Cable flag: the same text twice with a rule between, for wrapping around a cable.",
+  "variables": {
+    "text": {
+      "description": "Cable name",
+      "example": "PSU-1 → SW-3"
+    }
+  },
+  "label": {
+    "gap_mm": 3,
+    "items": [
+      {
+        "type": "text",
+        "text": "{{text}}",
+        "font": "sans-condensed",
+        "size_mm": 5
+      },
+      {
+        "type": "rule"
+      },
+      {
+        "type": "text",
+        "text": "{{text}}",
+        "font": "sans-condensed",
+        "size_mm": 5
+      }
+    ]
+  }
+}

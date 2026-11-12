@@ -1,0 +1,10 @@
+out/
+__pycache__/
+.venv/
+*.pyc
+docs/*.txt
+ptlabel.env
+data/
+.env
+docs/*.pdf
+.claude/

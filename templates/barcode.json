@@ -1,0 +1,6 @@
+{
+  "name": "barcode",
+  "description": "Code 128 barcode with human-readable text.",
+  "variables": {"data": {"description": "Barcode contents", "example": "SKU-4471"}},
+  "label": {"items": [{"type": "barcode", "data": "{{data}}"}]}
+}

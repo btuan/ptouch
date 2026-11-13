@@ -1,0 +1,5 @@
+# udev rule: let members of the "lp" group use Brother P-touch printers over USB (libusb).
+# Debian/Ubuntu/Fedora:  sudo cp docs/60-ptouch.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+#                        sudo usermod -aG lp "$USER"   (then log out and back in)
+# NixOS: services.udev.extraRules = '' <the line below> '';  and add "lp" to your user's extraGroups.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04f9", MODE="0660", GROUP="lp"

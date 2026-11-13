@@ -5,8 +5,8 @@ over USB), from code, a CLI, or an HTTP API. Labels are plain JSON, so coding ag
 can compose them without touching printer internals.
 
 ```
-JSON spec ──► render (Pillow) ──► raster (Brother raster protocol) ──► TCP 9100
- Label/Job      text, QR, DataMatrix,     PackBits, half-cuts,           + SNMP status
+JSON spec ──► render (Pillow) ──► raster (Brother raster protocol) ──► TCP 9100 + SNMP status (PT-P950NW)
+ Label/Job      text, QR, DataMatrix,     PackBits, half-cuts,           USB + ESC i S status (PT-E560BT)
  Template       barcodes, images          chain, hi-res, mirror
 ```
 
@@ -15,7 +15,9 @@ JSON spec ──► render (Pillow) ──► raster (Brother raster protocol) �
 | `spec.py` | Pydantic models: `Label`, `Job`, item types. **The contract.** |
 | `render.py` | Label → 1-bit image sized to the print head; `preview()` for humans |
 | `device.py` | Raster command encoding, verified on real tape (see `NOTES.md`) |
-| `printer.py` | Job → bytes; `Printer` (status over SNMP, print, tape check) |
+| `printer.py` | Job → sub-jobs; network and USB `Printer`s (status, print, tape check) |
+| `usbio.py` | USB transport: status replies, print-and-wait |
+| `fonts.py`, `gs1.py` | Bundled fonts; GS1 element strings |
 | `templates.py` | Label specs with `{{variables}}`, stored in `templates/*.json` |
 | `library.py` | Saved labels and print history in SQLite |
 | `discover.py` | Find printers on USB and the local network |
@@ -24,19 +26,89 @@ JSON spec ──► render (Pillow) ──► raster (Brother raster protocol) �
 
 ## Setup
 
+Needs Python 3.11+ and [uv](https://docs.astral.sh/uv/). Fonts are bundled, so nothing else is
+needed to design labels and render previews; printers need the extras below.
+
 ```bash
 uv sync
 uv run pytest
+uv run ptlabel serve          # http://127.0.0.1:8765/  (--host 0.0.0.0 to share on the LAN)
 ```
 
-Printers are found automatically: USB printers when ptlabel starts (needs libusb,
-`brew install libusb`), network printers by an SNMP sweep of the local /24 (the PT-P950NW
-doesn't advertise Bonjour). `ptlabel discover` lists every Brother device found, supported
-or not; the UI's printer menu has "Find printers…". `PTLABEL_PRINTER` pins a network printer
-by address; `PTLABEL_SCAN` sets the subnets to sweep (comma-separated CIDRs);
-`PTLABEL_DISCOVER=0` turns off the server's startup sweep.
-Choose a printer with `--printer e560bt` (CLI), `?printer=e560bt` (API) or the picker in the UI.
-Set `PTLABEL_DEFAULT_PRINTER` to change the default, `PTLABEL_USB=0` to skip USB.
+### macOS
+
+```bash
+brew install uv libusb        # libusb: only for USB printers (PT-E560BT)
+```
+
+`snmpget` (network printer status) ships with macOS. USB printers need no permissions setup.
+ptlabel finds Homebrew's libusb in `/opt/homebrew/lib` or `/usr/local/lib`.
+
+### Linux (Debian / Ubuntu / Raspberry Pi OS / Fedora)
+
+```bash
+sudo apt install libusb-1.0-0 snmp            # Fedora: sudo dnf install libusb1 net-snmp-utils
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+USB printers: by default only root can open them. Install the udev rule and join the `lp` group:
+
+```bash
+sudo cp docs/60-ptouch.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+sudo usermod -aG lp "$USER"                    # then log out and back in (or use `sg lp -c ...`)
+```
+
+ptlabel detaches the kernel's `usblp` driver from the printer when it prints; CUPS shouldn't be
+configured for the same printer. If libusb is installed somewhere unusual, point
+`PTLABEL_LIBUSB` at `libusb-1.0.so.0`.
+
+### NixOS
+
+Prebuilt Python wheels can't find system libraries on NixOS, so the scripts fetch what's needed
+from nixpkgs into `./.nix` (nothing is added to your profile or system config):
+
+```bash
+scripts/setup-nixos.sh                                 # uv sync + libusb, zlib, libstdc++
+sg lp -c scripts/run-nixos.sh                          # or keep it running in tmux:
+tmux new -d -s ptlabel 'sg lp -c ~/ptlabel/scripts/run-nixos.sh'
+```
+
+`run-nixos.sh` reads settings and secrets from `ptlabel.env` (git-ignored; keep it `chmod 600`).
+For USB access add the rule from `docs/60-ptouch.rules` to `services.udev.extraRules` and `"lp"`
+to your user's `extraGroups` (a one-off `sudo usermod -aG lp $USER` also works until the next
+rebuild). The NixOS firewall only allows SSH by default: open the port in
+`networking.firewall.allowedTCPPorts`, or reach the UI over SSH:
+`ssh -N -L 8765:127.0.0.1:8765 user@host`. `snmpget` (network printers): `nixpkgs#net-snmp`.
+
+### Docker
+
+`compose.yaml` builds an image for network printers (see Deploy below). USB printers aren't
+supported in the container (no libusb, no device passthrough); run ptlabel directly on the host
+for those.
+
+### Printers
+
+Printers are found automatically: USB printers when ptlabel starts, network printers by an SNMP
+sweep of the local /24 (the PT-P950NW doesn't advertise Bonjour). `ptlabel discover` lists every
+Brother device found, supported or not; the UI's printer menu has "Find printers…". Choose a
+printer with `--printer e560bt` (CLI), `?printer=e560bt` (API) or the picker in the UI.
+
+### Settings
+
+| Variable | Default | |
+|---|---|---|
+| `PTLABEL_PRINTER` | none | network printer address (IP or hostname), pinned even if discovery misses it |
+| `PTLABEL_DEFAULT_PRINTER` | configured, else first found | e.g. `e560bt` |
+| `PTLABEL_USB` | `1` | `0` skips USB printers |
+| `PTLABEL_LIBUSB` | search | path to `libusb-1.0.so.0` / `.dylib` if it isn't found |
+| `PTLABEL_SCAN` | this machine's /24 | subnets to sweep, comma-separated CIDRs |
+| `PTLABEL_DISCOVER` | `1` | `0` turns off the server's startup network sweep |
+| `PTLABEL_DB` | `~/.local/share/ptlabel/ptlabel.db` | saved labels and print history; `off` disables |
+| `PTLABEL_TEMPLATES` | `templates/` | template folder |
+| `PTLABEL_TOKEN` | none | require `Authorization: Bearer <token>` (the UI asks for it) |
+| `ANTHROPIC_API_KEY` | none | enables "Describe a label" |
+| `PTLABEL_MODEL`, `PTLABEL_EFFORT` | `claude-opus-5-5`, `medium` | designer model and effort |
+| `PTLABEL_DESIGN_TURNS`, `PTLABEL_DESIGN_CONCURRENCY` | `10`, `2` | designer limits |
 
 ## Label spec
 
@@ -160,7 +232,7 @@ wrapped into rows, so they stay legible and under the API's 8000 px image limit.
 edits it ("make the date bigger"). Settings: `PTLABEL_MODEL` (default `claude-opus-5-5`),
 `PTLABEL_EFFORT` (`medium`), `PTLABEL_DESIGN_TURNS` (10), `PTLABEL_DESIGN_CONCURRENCY` (2).
 
-## Deploy (Raspberry Pi / Docker)
+## Deploy (Docker, e.g. a Raspberry Pi)
 
 ```bash
 rsync -a --exclude .venv --exclude .git --exclude out --exclude .env --exclude data ./ user@host:ptlabel/

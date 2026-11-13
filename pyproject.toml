@@ -19,7 +19,11 @@ dependencies = [
 ptlabel = "ptlabel.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "httpx>=0.27"]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",
+    "zxing-cpp>=3.1.1",
+]
 
 [build-system]
 requires = ["hatchling"]

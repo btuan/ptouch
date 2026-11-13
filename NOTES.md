@@ -47,3 +47,8 @@ on 2026-11-12.
 | After a cut | The next label starts ~10 mm after the cut (cutter-to-head distance) |
 | Half-cut | Works (`ESC i K` bit 2), confirmed on tape, though ptouch-print doesn't offer it. Default between labels, as on the P950NW |
 | High-res | Not supported |
+| Per-page cuts | **Ignored.** Different `ESC i K` / `ESC i A` per page (half, full, none per label) printed half-cuts everywhere: the first page's settings apply to the whole job (tape test 2026-11-12). Per-label cuts are therefore built from job-level settings: "no cut" labels are merged into one page, irregular full cuts split the job into back-to-back jobs. |
+| Split jobs | Back-to-back jobs in one USB write work (tape test 2026-11-12: "1 FULL" | "2 HALF / 3 NONE 4 HALF / 5 END" came out as intended). Unchained, each new job feeds a fresh ~25 mm leader. |
+| Chained joins | Chaining every sub-job but the last (`ESC i K` bit 3 clear) removes that leader and the printer still full-cuts at the join (tape test 2026-11-12). Same behaviour as the PT-P950NW. |
+| Chained multi-label jobs | Hung when the next job's data arrived while the printer was at a chained join (two 2-label chained pieces sent in one write). Fixed by sending each sub-job only after the previous has printed: the same 7-label job then printed correctly (2026-11-13). |
+| Status while printing | A bare `ESC i S` (no `ESC @`) is safe at any time, including between chained jobs. The reply block doesn't change while printing, but the printer **doesn't answer while it prints** and answers again as soon as it's done (probe: 1 label busy ~6 s; chained 1+2+1 labels busy 2.4 / 6 / 10 s). ptlabel uses this to know when each sub-job is done. |

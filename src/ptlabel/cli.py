@@ -23,7 +23,7 @@ from pydantic import ValidationError
 
 from .device import P950NW
 from .printer import (Printer, PrinterError, compile_job, default_printers, get_printer,
-                      label_length_mm, separator)
+                      cuts_between, label_length_mm)
 from .render import RenderError, preview
 from .spec import Job, Label, schemas
 from .templates import TemplateStore
@@ -53,12 +53,13 @@ def do_render(job: Job, out: str, printer: Printer | None) -> dict:
     tape = resolve_tape(job, printer)
     model = printer.model if printer else P950NW
     data, images = compile_job(job, tape, model)
-    preview(images, tape, job.hires, separator(job, model), job.margin_mm, model=model).save(out)
+    preview(images, tape, job.hires, cuts_between(job, model), job.margin_mm, model=model).save(out)
     return {"preview": out, "printer": model.key, "tape_mm": tape, "labels": len(images), "bytes": len(data),
             "length_mm": round(label_length_mm(images, job, model.dpi), 1)}
 
 
-def do_print(job: Job, printer: Printer, dry_run: bool, bin_out: str | None) -> dict:
+def do_print(job: Job, printer: Printer, dry_run: bool, bin_out: str | None,
+             template: str | None = None, vars=None) -> dict:
     if dry_run:
         tape = resolve_tape(job, printer)
         data, images = compile_job(job, tape, printer.model)
@@ -66,7 +67,8 @@ def do_print(job: Job, printer: Printer, dry_run: bool, bin_out: str | None) -> 
             Path(bin_out).write_bytes(data)
         return {"dry_run": True, "printer": printer.model.key, "tape_mm": tape, "labels": len(images),
                 "bytes": len(data), "length_mm": round(label_length_mm(images, job, printer.model.dpi), 1)}
-    return printer.print(job)
+    from .library import open_default, print_and_record
+    return print_and_record(open_default(), printer, job, source="cli", template=template, vars=vars)
 
 
 def _vars(pairs: list[str]) -> dict:
@@ -94,7 +96,9 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status")
-    sub.add_parser("printers")
+    sub.add_parser("printers", help="printers ptlabel can use (USB, PTLABEL_PRINTER, network sweep)")
+    p = sub.add_parser("discover", help="find Brother printers on USB and the local network")
+    p.add_argument("--timeout", type=float, default=2.0)
     p = sub.add_parser("schema"); p.add_argument("which", nargs="?", choices=["Label", "Job", "Template"])
     p = sub.add_parser("render"); p.add_argument("spec"); p.add_argument("-o", "--out", default="label.png")
     p.add_argument("--tape", type=int)
@@ -106,6 +110,17 @@ def main(argv=None):
     p = sub.add_parser("decode"); p.add_argument("bin"); p.add_argument("-o", "--out", default="decoded.png")
     p = sub.add_parser("serve"); p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
+
+    p = sub.add_parser("history", help="past prints, newest first")
+    p.add_argument("-q", "--query"); p.add_argument("-n", "--limit", type=int, default=20)
+    p = sub.add_parser("reprint", help="print a past job again"); p.add_argument("id", type=int)
+    p.add_argument("--dry-run", action="store_true")
+    sv = sub.add_parser("saved", help="saved labels").add_subparsers(dest="scmd", required=True)
+    p = sv.add_parser("list"); p.add_argument("-q", "--query")
+    p = sv.add_parser("show"); p.add_argument("id", type=int)
+    p = sv.add_parser("save"); p.add_argument("name"); p.add_argument("spec", help="Job/Label JSON file or -")
+    p = sv.add_parser("print"); p.add_argument("id", type=int); p.add_argument("--dry-run", action="store_true")
+    p = sv.add_parser("delete"); p.add_argument("id", type=int)
 
     t = sub.add_parser("template").add_subparsers(dest="tcmd", required=True)
     t.add_parser("list")
@@ -121,7 +136,10 @@ def main(argv=None):
             p.add_argument("--dry-run", action="store_true")
 
     a = ap.parse_args(argv)
-    printer = get_printer(a.printer)
+    try:
+        printer = get_printer(a.printer)
+    except PrinterError:
+        printer = None            # fine for render/schema/decode; status/print report it below
     try:
         result = _run(a, printer)
     except (ValidationError, RenderError, PrinterError, ValueError, KeyError, OSError) as e:
@@ -131,12 +149,21 @@ def main(argv=None):
         print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
-def _run(a, printer: Printer):
+def _need(printer: Printer | None) -> Printer:
+    if printer is None:
+        raise PrinterError("no printer: plug one in over USB, set PTLABEL_PRINTER, or pass --printer <host>")
+    return printer
+
+
+def _run(a, printer: Printer | None):
     if a.cmd == "status":
-        return printer.status().as_dict()
+        return _need(printer).status().as_dict()
+    if a.cmd == "discover":
+        from .discover import discover
+        return [f.as_dict() for f in discover(a.timeout)]
     if a.cmd == "printers":
         out = []
-        for p in default_printers().values():
+        for p in default_printers(scan_network=True).values():
             try:
                 st = p.status().as_dict()
             except PrinterError as e:
@@ -149,11 +176,11 @@ def _run(a, printer: Printer):
     if a.cmd == "render":
         return do_render(load_job(a.spec, a.tape), a.out, printer)
     if a.cmd == "print":
-        return do_print(load_job(a.spec, a.tape), printer, a.dry_run, a.bin)
+        return do_print(load_job(a.spec, a.tape), _need(printer), a.dry_run, a.bin)
     if a.cmd == "text":
         job = Job(tape_mm=a.tape, labels=[Label(items=[{"type": "text", "text": a.text.replace("\\n", "\n"),
                                                          "font": a.font}])])
-        return printer.print(job) if a.print else do_render(job, a.out, printer)
+        return do_print(job, _need(printer), False, None) if a.print else do_render(job, a.out, printer)
     if a.cmd == "decode":
         from .decode import decode
         pages = decode(Path(a.bin).read_bytes())
@@ -165,6 +192,8 @@ def _run(a, printer: Printer):
         import uvicorn
         uvicorn.run("ptlabel.api:app", host=a.host, port=a.port)
         return None
+    if a.cmd in ("history", "reprint", "saved"):
+        return _library(a, printer)
     if a.cmd == "template":
         store = TemplateStore()
         if a.tcmd == "list":
@@ -176,7 +205,40 @@ def _run(a, printer: Printer):
         job = tpl.job(_rows(a.rows, _vars(a.var)), tape_mm=a.tape)
         if a.tcmd == "render":
             return do_render(job, a.out, printer)
-        return do_print(job, printer, a.dry_run, None)
+        rows = _rows(a.rows, _vars(a.var))
+        return do_print(job, _need(printer), a.dry_run, None, template=tpl.name,
+                        vars=rows if a.rows else rows[0])
+
+
+def _library(a, printer: Printer | None):
+    from .library import Library, job_thumb, print_and_record
+    lib = Library()
+    if a.cmd == "history":
+        return lib.history(a.query, a.limit)
+    if a.cmd == "reprint":
+        e = lib.print_entry(a.id)
+        job = Job.model_validate(e["job"])
+        if a.dry_run:
+            return do_print(job, _need(printer), True, None)
+        return print_and_record(lib, _need(printer), job, source="reprint", reprint_of=a.id,
+                                label_id=e["label_id"], template=e["template"], vars=e["vars"])
+    if a.scmd == "list":
+        return lib.labels(a.query)
+    if a.scmd == "show":
+        return lib.get(a.id)
+    if a.scmd == "save":
+        job = load_job(a.spec)
+        model = printer.model if printer else P950NW
+        return lib.save(a.name, job.model_dump(mode="json", exclude_none=True), "cli",
+                        job_thumb(job, job.resolved_tape(12), model))
+    if a.scmd == "print":
+        job = Job.model_validate(lib.get(a.id)["job"])
+        if a.dry_run:
+            return do_print(job, _need(printer), True, None)
+        return print_and_record(lib, _need(printer), job, source="cli", label_id=a.id)
+    if a.scmd == "delete":
+        lib.delete(a.id)
+        return {"deleted": a.id}
 
 
 if __name__ == "__main__":

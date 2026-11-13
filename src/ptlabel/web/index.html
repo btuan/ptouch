@@ -8,29 +8,40 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><svg class="mark" viewBox="0 0 24 14" aria-hidden="true"><rect x="1" y="1" width="22" height="12" rx="1.5"/><path d="M9 1v12" stroke-dasharray="2 2"/></svg>ptlabel</div>
+  <div class="brand"><svg class="mark" viewBox="0 0 24 14" aria-hidden="true"><rect x="1" y="1" width="22" height="12" rx="1.5"/><path d="M9 1v12" stroke-dasharray="2 2"/></svg><span class="wide-only">ptlabel</span></div>
   <div class="top-right">
     <button class="btn ghost sm" id="new-job" title="Clear and start a new label">New</button>
-    <button class="btn ghost sm" id="spec-open" aria-haspopup="dialog" title="View or edit the job as JSON">{ } Spec</button>
+    <button class="btn ghost sm" id="spec-open" aria-haspopup="dialog" title="View or edit the job as JSON" aria-label="Job spec (JSON)">{ }<span class="wide-only"> Spec</span></button>
     <select id="printer-pick" class="printer-pick" aria-label="Printer" hidden></select>
     <div id="printer" class="printer" role="status">
-      <span class="dot"></span><span id="printer-text">Checking printer…</span>
+      <span class="dot"></span><span id="printer-text">Checking printer…</span><span id="printer-short" aria-hidden="true">…</span>
       <button class="link" id="printer-retry" hidden>Retry</button>
+    </div>
+    <div class="more mobile-only">
+      <button class="btn ghost sm" id="more-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="more-menu" aria-label="More actions">⋯</button>
+      <div class="menu" id="more-menu" role="menu" hidden>
+        <button role="menuitem" data-act="new">New job</button>
+        <button role="menuitem" data-act="spec">Job spec (JSON)</button>
+        <button role="menuitem" data-act="find">Find printers</button>
+        <button role="menuitem" data-act="retry">Check printer again</button>
+      </div>
     </div>
   </div>
 </header>
 
 <main class="layout">
-  <aside class="editor" aria-label="Editor">
+  <aside class="editor" id="editor" aria-label="Editor">
     <div class="tabs" role="tablist" aria-label="Editor mode">
       <button role="tab" id="tab-design" aria-controls="panel-design" data-tab="design" aria-selected="true">Design</button>
       <button role="tab" id="tab-template" aria-controls="panel-template" data-tab="template" aria-selected="false" tabindex="-1">Templates</button>
+      <button role="tab" id="tab-library" aria-controls="panel-library" data-tab="library" aria-selected="false" tabindex="-1">Library</button>
     </div>
 
     <section class="panel" id="panel-design" role="tabpanel" aria-labelledby="tab-design">
       <form class="card ai" id="ai" hidden>
         <label for="ai-prompt" class="ai-h">Describe a label <span class="h-note" id="ai-model"></span></label>
         <textarea id="ai-prompt" rows="2" maxlength="4000" placeholder="e.g. cable labels for HDMI 1–4, or “make the text bigger”"></textarea>
+        <label class="ai-fresh"><input type="checkbox" id="ai-fresh"> Start a new design <span class="h-note">(otherwise Claude edits the current job)</span></label>
         <div class="ai-row">
           <span class="ai-status" id="ai-status" aria-live="polite"></span>
           <button class="btn primary" id="ai-go" type="submit">Design</button>
@@ -54,13 +65,9 @@
       </div>
 
       <details class="section" id="layout-section">
-        <summary><h2>Arrangement</h2><span class="summary-note" id="layout-note"></span></summary>
+        <summary><h2>This label <span class="h-note" id="layout-label-name"></span></h2><span class="summary-note" id="layout-note"></span></summary>
+        <p class="hint">Layout and cut for the selected label only. Settings for the whole print are under <b>Job</b> in the bar below the preview.</p>
         <div id="label-form" class="form"></div>
-      </details>
-
-      <details class="section" id="cut-section">
-        <summary><h2>Cutting &amp; quality</h2><span class="summary-note" id="cut-note"></span></summary>
-        <div id="job-form" class="form"></div>
       </details>
 
       <details class="section">
@@ -95,18 +102,52 @@
         </div>
       </div>
     </section>
+
+    <section class="panel" id="panel-library" role="tabpanel" aria-labelledby="tab-library" hidden>
+      <div class="section">
+        <h2>Save this job</h2>
+        <form class="save-row" id="lib-save">
+          <input id="lib-name" placeholder="Name, e.g. Spice jars" autocomplete="off" aria-label="Name for the saved job" maxlength="200">
+          <button class="btn primary" id="lib-save-btn" type="submit">Save</button>
+          <button class="btn" id="lib-save-new" type="button" hidden>Save as new</button>
+        </form>
+        <p class="hint" id="lib-save-note"></p>
+      </div>
+      <div class="section">
+        <div class="lib-head">
+          <h2>Saved</h2>
+          <input id="lib-q" type="search" placeholder="Search names and text" aria-label="Search saved labels" autocomplete="off">
+        </div>
+        <ul id="lib-list" class="lib-list" aria-label="Saved labels"></ul>
+      </div>
+      <div class="section">
+        <div class="lib-head">
+          <h2>Printed</h2>
+          <span class="h-note" id="hist-stats"></span>
+        </div>
+        <ul id="hist-list" class="lib-list" aria-label="Print history"></ul>
+        <button class="btn ghost sm" id="hist-more" hidden>Show more</button>
+      </div>
+    </section>
   </aside>
+  <div class="resizer" id="resizer" role="separator" aria-orientation="vertical" aria-controls="editor"
+       aria-label="Resize the editor panel" tabindex="0" title="Drag to resize · double-click to reset"></div>
 
   <section class="stage" aria-label="Preview and print">
     <div class="strip-bar">
-      <div id="label-strip" class="label-strip" role="toolbar" aria-label="Labels in this print job"></div>
+      <div class="label-nav" id="label-nav" aria-live="polite">
+        <b id="label-pos">Label 1</b> <span id="label-name"></span>
+        <span class="label-hint" id="label-hint">Click a label in the preview to select it · drag to reorder</span>
+      </div>
       <div class="btn-row strip-tools">
-        <button class="btn ghost sm" id="dup-label">Duplicate label</button>
-        <button class="btn ghost sm" id="del-label">Delete label</button>
+        <button class="btn ghost sm" id="add-label" title="Add another label to this print job">+ Add label</button>
+        <button class="btn ghost sm" id="dup-label" title="Copy the selected label">Duplicate</button>
+        <button class="btn ghost sm" id="del-label" title="Delete the selected label (Undo available)">Delete</button>
       </div>
     </div>
 
     <div class="preview-box">
+      <span class="copies-badge" id="copies-badge" hidden></span>
       <div class="zoom" role="group" aria-label="Zoom">
         <button data-zoom="fit" aria-pressed="true" title="Fit to the window (up to 4×)">Fit</button>
         <button data-zoom="1" aria-pressed="false" title="About real size on most screens">1:1</button>
@@ -115,7 +156,8 @@
       </div>
       <div class="preview-wrap" id="preview-wrap">
         <div class="preview" id="preview">
-          <div class="tape" id="tape"><img id="preview-img" alt=""><div class="hl" id="hl" hidden></div></div>
+          <div class="tape" id="tape"><img id="preview-img" alt="" draggable="false"><div class="lboxes" id="lboxes" role="group"
+            aria-label="Labels in the preview. Arrow keys select, Alt+arrows move, Delete removes."></div></div>
           <div class="ruler" id="ruler" aria-hidden="true"></div>
           <div class="skeleton" id="skeleton"></div>
         </div>
@@ -133,6 +175,17 @@
     <div class="actionbar">
       <label class="inline"><span class="lbl">Tape</span> <select id="tape-select" aria-label="Tape width"></select></label>
       <label class="inline"><span class="lbl">Copies</span><span class="x" aria-hidden="true">×</span> <input id="copies" aria-label="Copies" type="number" min="1" max="100" value="1" inputmode="numeric"></label>
+      <div class="job-wrap">
+        <button class="btn job-btn" id="job-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="job-pop"
+                title="Cuts, quality and other settings for the whole print"><span class="ico" aria-hidden="true">⚙</span>
+          <span class="lbl">Job settings</span><span class="sep" aria-hidden="true">·</span><span id="cut-note"></span><span id="cut-note-short"></span>
+          <span class="caret" aria-hidden="true">▾</span></button>
+        <div class="job-pop" id="job-pop" role="dialog" aria-labelledby="job-pop-h" hidden>
+          <h3 id="job-pop-h">Whole job</h3>
+          <p class="hint">Applies to every label in this print. A label's own “Cut after” overrides the cut between labels.</p>
+          <div id="job-form" class="form"></div>
+        </div>
+      </div>
       <span class="spacer"></span>
       <button class="btn ghost icon" id="download" title="Download preview PNG" aria-label="Download preview PNG">⤓</button>
       <div class="print-wrap">

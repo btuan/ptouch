@@ -17,6 +17,8 @@ JSON spec ──► render (Pillow) ──► raster (Brother raster protocol) �
 | `device.py` | Raster command encoding, verified on real tape (see `NOTES.md`) |
 | `printer.py` | Job → bytes; `Printer` (status over SNMP, print, tape check) |
 | `templates.py` | Label specs with `{{variables}}`, stored in `templates/*.json` |
+| `library.py` | Saved labels and print history in SQLite |
+| `discover.py` | Find printers on USB and the local network |
 | `decode.py` | Parse printer bytes back into settings + images (tests, debugging) |
 | `cli.py` / `api.py` | Front ends |
 
@@ -27,11 +29,14 @@ uv sync
 uv run pytest
 ```
 
-Set `PTLABEL_PRINTER` to the network printer's IP address or hostname.
-USB printers (PT-E560BT) need libusb (`brew install libusb`); they're picked up automatically.
+Printers are found automatically: USB printers when ptlabel starts (needs libusb,
+`brew install libusb`), network printers by an SNMP sweep of the local /24 (the PT-P950NW
+doesn't advertise Bonjour). `ptlabel discover` lists every Brother device found, supported
+or not; the UI's printer menu has "Find printers…". `PTLABEL_PRINTER` pins a network printer
+by address; `PTLABEL_SCAN` sets the subnets to sweep (comma-separated CIDRs);
+`PTLABEL_DISCOVER=0` turns off the server's startup sweep.
 Choose a printer with `--printer e560bt` (CLI), `?printer=e560bt` (API) or the picker in the UI.
 Set `PTLABEL_DEFAULT_PRINTER` to change the default, `PTLABEL_USB=0` to skip USB.
-Fonts default to macOS system fonts (SF Pro / SF Mono).
 
 ## Label spec
 
@@ -52,9 +57,26 @@ and text auto-fits unless `size_mm` is set.
 }
 ```
 
+Fonts are bundled (IBM Plex, SIL Open Font License, in `src/ptlabel/fonts/`) and are the only
+ones labels use, so a saved label renders and prints the same on every machine: `sans`,
+`sans-light`, `sans-medium`, `sans-bold`, `sans-condensed`, `sans-condensed-bold`, `mono`,
+`mono-bold`, `serif`, `serif-bold`. Any text can also be `"italic": true` and/or
+`"underline": true`.
+
+Cuts: labels in a job are separated by the job's `separator` (half-cut by default). A label can
+override the cut after itself with `"cut_after": "full_cut" | "half_cut" | "none"`; in previews a
+full cut starts a new row, so you see the separate pieces that come out. `copies` prints the whole
+set N times (A B C, A B C); `copy_cut` sets the cut between copies (default: the separator), and
+`full_cut_every` counts every label printed.
+
+GS1: a `datamatrix` with `"gs1": true` takes Application Identifiers in brackets, e.g.
+`(01)09501101530003(17)261231(10)LOT7(21)SN42`. It's validated before printing (known AIs, lengths,
+GTIN/SSCC/GLN check digits, YYMMDD dates, GS1 character set) and encoded with FNC1, so scanners
+report it as GS1 DataMatrix (`]d2`). Supported AIs are listed in `gs1.py`.
+
 Item types: `text`, `qr`, `datamatrix`, `barcode` (code128, code39, ean13, ean8, upca, itf),
-`image` (path or data URI), `spacer`, `rule`. Label options: `length_mm`, `justify`,
-`gap_mm`, `pad_mm`, `border`, `invert`. Job options: `copies`, `separator`
+`image` (path or data URI), `spacer`, `rule`. Label options: `length_mm`, `justify`, `cut_after`,
+`gap_mm`, `pad_mm`, `border`, `invert`. Job options: `copies`, `copy_cut`, `separator`
 (`half_cut` | `full_cut` | `none`), `full_cut_every`, `chain`, `hires`, `mirror`, `margin_mm`.
 Full schema: `uv run ptlabel schema` or `GET /schema`.
 
@@ -89,6 +111,21 @@ to-scale tape with a mm ruler, and print. The UI only ever edits one Job spec, s
 see is what prints; `{ } Spec` shows that JSON. `scripts/shot.sh` takes headless screenshots
 for design review (narrow widths are unreliable in headless Chrome; use a real browser).
 
+## Saved labels and print history
+
+Every print is logged to a SQLite file: the exact spec sent, when, which printer, tape width,
+label count, tape used, and the error if it failed. Jobs can be saved by name and reopened.
+In the UI it's the Library tab (save/update, search, open, delete with undo; past prints with
+Open and Reprint). The database is `~/.local/share/ptlabel/ptlabel.db`; set `PTLABEL_DB` to move
+it, or `PTLABEL_DB=off` to turn history off. In Docker it's `/data/ptlabel.db`.
+
+```bash
+uv run ptlabel history -n 10            # recent prints (-q to search)
+uv run ptlabel reprint 42               # print history entry 42 again
+uv run ptlabel saved save "Spice jars" spec.json
+uv run ptlabel saved list | show 3 | print 3 | delete 3
+```
+
 ## HTTP API
 
 `uv run ptlabel serve` (127.0.0.1:8765; interactive docs at `/docs`). Set `PTLABEL_TOKEN`
@@ -98,11 +135,17 @@ to require `Authorization: Bearer <token>`.
 |---|---|---|
 | GET | `/schema` | JSON Schemas for Label, Job, Template |
 | GET | `/printers` | printers available, with dpi, tape widths, half-cut/hi-res support |
+| POST | `/printers/discover` | rescan USB + network; also lists unsupported Brother devices |
 | GET | `/printer/status` | tape, state, errors (`?printer=` on this and every render/print route) |
 | POST | `/render?format=png\|json` | Job or Label → preview |
 | POST | `/print?dry_run=` | Job or Label → printer |
 | GET/PUT/DELETE | `/templates/{name}` | manage templates |
 | POST | `/templates/{name}/render`, `/print` | body `{"vars": {...}}` or `{"rows": [...]}`, optional `"job": {...}` |
+| GET/POST | `/labels` | saved labels (`?q=` search); POST `{"name", "job"}` |
+| GET/PUT/DELETE | `/labels/{id}` | one saved label; `/labels/{id}/thumb.png` |
+| GET | `/history` | past prints (`?q=`, `?printer=`, `?ok=`); `/history/stats` for totals |
+| GET | `/history/{id}` | one print, with its job; `/history/{id}/thumb.png` |
+| POST | `/history/{id}/reprint` | print it again (`?printer=` to use another printer) |
 | POST | `/design` | `{"prompt", "job"?, "tape_mm"?}` → server-sent events: `status`, `preview`, then `done` or `error` |
 
 ## Describe a label (Claude)
@@ -110,7 +153,10 @@ to require `Authorization: Bearer <token>`.
 With `ANTHROPIC_API_KEY` set, the UI shows a "Describe a label" box and `POST /design` works.
 `design.py` runs a small agent loop: Claude drafts a Job, calls `render_preview` to see the exact
 raster image, fixes problems (spec errors are fed back to it), and finishes with `submit_design`,
-optionally proposing a reusable Template. Nothing is printed. If you pass the current job, Claude
+optionally proposing a reusable Template. Nothing is printed. It can also read (never change)
+your saved labels, templates and print history (`design_tools.py`): "two more like my spice jar
+labels", "asset-tag for A-200 to A-210", "same as last time". Long strips are sent to Claude
+wrapped into rows, so they stay legible and under the API's 8000 px image limit. If you pass the current job, Claude
 edits it ("make the date bigger"). Settings: `PTLABEL_MODEL` (default `claude-opus-5-5`),
 `PTLABEL_EFFORT` (`medium`), `PTLABEL_DESIGN_TURNS` (10), `PTLABEL_DESIGN_CONCURRENCY` (2).
 
@@ -123,9 +169,7 @@ ssh user@host 'cd ~/ptlabel && docker compose up -d --build'
 
 `ptlabel.env` on the host holds `PTLABEL_PRINTER=<printer IP>` and, for Claude design,
 `ANTHROPIC_API_KEY=...` (mode 600, not in git). Templates live in
-`./data/templates` (seeded from `templates/` on first start). On Linux the fonts are Inter, Roboto
-Condensed and DejaVu Sans Mono under the same names (`sans`, `sans-condensed`, `mono`, ...), so
-label widths differ slightly from macOS. The UI is at http://<host>:8765/ and has no login:
+`./data/templates` (seeded from `templates/` on first start). The UI is at http://<host>:8765/ and has no login:
 anyone who can reach it can print and spend API credit. Set `PTLABEL_TOKEN` to require a token.
 
 ## For coding agents

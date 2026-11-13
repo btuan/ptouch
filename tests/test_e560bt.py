@@ -69,3 +69,47 @@ def test_single_page_job_is_flagged_last_page():
     assert decode(compile_job(one, 12, M)[0])[0].settings["page_flag"] == 2
     assert decode(compile_job(one, 12, device.P950NW)[0])[0].settings["page_flag"] == 0
     assert [p.settings["page_flag"] for p in decode(compile_job(job(), 12, M)[0])] == [0, 2]
+
+
+class FakeUsb:
+    """Fake endpoints: the printer is silent for `busy` polls, then answers with `reply`."""
+    def __init__(self, busy, reply):
+        self.busy, self.reply, self.polls, self.data = busy, reply, 0, b""
+
+    def write(self, data, timeout=None):
+        if data == b"\x1biS":
+            self.polls += 1
+        else:
+            self.data += data
+
+    def read(self, n, timeout=None):
+        import usb.core
+        if self.polls and self.polls > self.busy and not getattr(self, "_answered", 0) == self.polls:
+            self._answered = self.polls
+            return self.reply
+        raise usb.core.USBTimeoutError("timeout", None, None)
+
+
+def _device(monkeypatch, fake):
+    from ptlabel import usbio
+    dev = usbio.UsbDevice(0x04F9, 0x2203)
+    monkeypatch.setattr(dev, "_open", lambda: (None, fake, fake))
+    monkeypatch.setattr(usbio, "_release", lambda d: None)
+    monkeypatch.setattr(usbio.time, "sleep", lambda s: None)
+    return dev
+
+
+IDLE = bytes.fromhex("802042307f30320000000c010000000000000000000000000108000000000000")
+
+
+def test_usb_print_waits_for_the_printer_to_answer_again(monkeypatch):
+    fake = FakeUsb(busy=4, reply=IDLE)
+    r = _device(monkeypatch, fake).print(b"JOB", pages=1, feed_mm=20)
+    assert fake.data == b"JOB" and r["confirmed_by"] == "status after busy" and fake.polls == 5
+
+
+def test_usb_print_stops_on_an_error_reply(monkeypatch):
+    from ptlabel.usbio import UsbError
+    cover_open = IDLE[:9] + b"\x10" + IDLE[10:]
+    with pytest.raises(UsbError, match="Cover open"):
+        _device(monkeypatch, FakeUsb(busy=2, reply=cover_open)).print(b"JOB", pages=1, feed_mm=20)

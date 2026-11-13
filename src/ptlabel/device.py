@@ -164,6 +164,7 @@ def unpackbits(data: bytes) -> bytes:
 @dataclass
 class Page:
     lines: list[bytes]
+    cut_after: str | None = None    # "half" | "full" | "none": override the job's cut after this page
 
 
 @dataclass
@@ -182,7 +183,7 @@ class JobOptions:
 
 
 def _page_header(o: JobOptions, n_lines: int, page_idx: int, n_pages: int,
-                 model: Model = P950NW) -> bytes:
+                 model: Model = P950NW, cut: str | None = None) -> bytes:
     if o.page_flags == "all2" or n_pages == 1:
         which = 2 if o.page_flags == "all2" or model.single_page_last else 0
     else:
@@ -193,8 +194,11 @@ def _page_header(o: JobOptions, n_lines: int, page_idx: int, n_pages: int,
     h += b"\x1biz" + bytes([0x02 | 0x04 | 0x08, media, o.tape_mm, 0]) \
         + n_lines.to_bytes(4, "little") + bytes([which, 0])                 # p.33
     h += b"\x1biM" + bytes([(0x40 if o.auto_cut else 0) | (0x80 if o.mirror else 0)])  # p.35
-    h += b"\x1biA" + bytes([o.cut_every])                                    # p.37
-    k = (0x01 if o.draft else 0) | (0x04 if o.half_cut else 0) \
+    half, every = o.half_cut, o.cut_every
+    if cut is not None:                      # per-page override (see Page.cut_after)
+        half, every = cut == "half", (1 if cut == "full" else 255)
+    h += b"\x1biA" + bytes([every])                                         # p.37
+    k = (0x01 if o.draft else 0) | (0x04 if half else 0) \
         | (0 if o.chain else 0x08) | (0x40 if o.hires else 0)
     h += b"\x1biK" + bytes([k])                                              # p.36
     floor = model.min_margin * (2 if o.hires else 1)
@@ -207,14 +211,14 @@ def _page_header(o: JobOptions, n_lines: int, page_idx: int, n_pages: int,
 def build_job(pages: list[Page], o: JobOptions, model: Model = P950NW) -> bytes:
     if o.hires and not model.hires:
         raise ValueError(f"{model.name} has no high-resolution mode")
-    if o.half_cut and not model.half_cut:
+    if (o.half_cut or any(p.cut_after == "half" for p in pages)) and not model.half_cut:
         raise ValueError(f"{model.name} can't half-cut")
     if o.compress and not model.compress:
         o = replace(o, compress=False)
     job = bytearray(b"\x00" * 200)          # invalidate (p.23)
     job += b"\x1b@"                          # initialize
     for i, p in enumerate(pages):
-        job += _page_header(o, len(p.lines), i, len(pages), model)
+        job += _page_header(o, len(p.lines), i, len(pages), model, p.cut_after)
         for line in p.lines:
             if o.compress and not any(line):
                 job += b"Z"                      # p.6: only valid with TIFF compression
@@ -230,7 +234,7 @@ def build_job(pages: list[Page], o: JobOptions, model: Model = P950NW) -> bytes:
 # --------------------------------------------------------------------- transport
 
 def _snmp(host: str, *oids: str) -> list[str]:
-    r = subprocess.run(["snmpget", "-v2c", "-c", "public", "-Oqv", "-t", "3", host, *oids],
+    r = subprocess.run(["snmpget", "-v2c", "-c", "public", "-Oqv", "-t", "2", "-r", "0", host, *oids],
                        capture_output=True, text=True, timeout=15)
     if r.returncode:
         raise RuntimeError(r.stderr.strip() or "snmpget failed")

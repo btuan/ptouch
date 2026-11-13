@@ -12,7 +12,9 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from . import fonts
 
 TAPE_WIDTHS = (6, 9, 12, 18, 24, 36)
 
@@ -27,11 +29,20 @@ class Text(_Item):
     """Text, one or more lines (use \\n). Auto-sized to fit unless size_mm is set."""
     type: Literal["text"] = "text"
     text: str = Field(min_length=1)
-    font: str = Field("sans", description="sans | sans-medium | sans-bold | sans-light | sans-condensed | sans-condensed-bold | mono | mono-bold | helvetica | helvetica-bold | path to a .ttf/.ttc")
+    font: str = Field("sans", description=fonts.DESCRIPTION)
+    italic: bool = False
+    underline: bool = False
     size_mm: float | None = Field(None, gt=0, description="Font size (em) in mm; omit to auto-fit.")
     align: Literal["left", "center", "right"] = "left"
     max_width_mm: float | None = Field(None, gt=0, description="Shrink text to fit this width.")
     line_spacing: float = Field(1.1, ge=0.8, le=3)
+
+    @field_validator("font")
+    @classmethod
+    def _known_font(cls, v: str) -> str:
+        if fonts.canonical(v) is None:
+            raise ValueError(f"unknown font {v!r}; use one of: {', '.join(fonts.NAMES)}")
+        return v
 
 
 class QR(_Item):
@@ -47,8 +58,17 @@ class DataMatrix(_Item):
     """ECC200 Data Matrix: denser than QR, good on narrow tape."""
     type: Literal["datamatrix"] = "datamatrix"
     data: str = Field(min_length=1)
+    gs1: bool = Field(False, description="GS1 DataMatrix: data is AIs in brackets, e.g. "
+                      "(01)09501101530003(17)261231(10)LOT7(21)SN42; validated and encoded with FNC1.")
     quiet_modules: int = Field(1, ge=0, le=4)
     min_module_mm: float = Field(0.2, ge=0.07, description="Refuse to render smaller (unscannable) modules.")
+
+    @model_validator(mode="after")
+    def _gs1(self):
+        if self.gs1 and "{{" not in self.data:          # templates are checked once filled
+            from . import gs1
+            gs1.parse(self.data)
+        return self
 
 
 class Barcode(_Item):
@@ -97,6 +117,8 @@ class Label(BaseModel):
     justify: Literal["start", "center", "end", "between"] = "center"
     border: bool = False
     invert: bool = False
+    cut_after: Literal["half_cut", "full_cut", "none"] | None = Field(
+        None, description="Cut after this label (ignored on the last). Default: the job's separator.")
 
     @model_validator(mode="after")
     def _tape(self):
@@ -116,7 +138,9 @@ class Job(BaseModel):
         None, description="Between labels. Default: half_cut where the printer supports it, "
                           "else full_cut.")
     full_cut_every: int | None = Field(None, ge=1, le=255,
-                                       description="With half_cut: also full-cut every N labels.")
+                                       description="Also full-cut every N labels printed (counts across copies).")
+    copy_cut: Literal["half_cut", "full_cut", "none"] | None = Field(
+        None, description="With copies > 1: the cut between copies of the set. Default: the separator.")
     chain: bool = Field(False, description="Leave the last label in the printer (no feed/cut).")
     hires: bool = Field(False, description="360x720 dpi (sharper text, slower).")
     mirror: bool = False
@@ -140,7 +164,10 @@ class Job(BaseModel):
         raise ValueError("tape width unknown: set tape_mm or let the printer report it")
 
     def expanded_labels(self) -> list[Label]:
-        return [l for l in self.labels for _ in range(self.copies)]
+        """Printing order: whole sets, copies times (A B C, A B C). Per-label cut_after
+        repeats in every set; full_cut_every counts every label printed; copy_cut is the cut
+        between sets."""
+        return [l for _ in range(self.copies) for l in self.labels]
 
 
 def schemas() -> dict:

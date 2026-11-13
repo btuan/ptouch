@@ -80,6 +80,8 @@ class UsbError(RuntimeError):
 
 def _backend():
     import usb.backend.libusb1 as b
+    if path := os.environ.get("PTLABEL_LIBUSB"):     # e.g. NixOS: .../libusb-1.0.30/lib/libusb-1.0.so.0
+        return b.get_backend(find_library=lambda _x: path)
     be = b.get_backend()
     if be is None:   # Homebrew's libusb isn't on the default search path on Apple Silicon
         for path in ("/opt/homebrew/lib/libusb-1.0.dylib", "/usr/local/lib/libusb-1.0.dylib"):
@@ -161,14 +163,15 @@ class UsbDevice:
             finally:
                 _release(d)
 
-    def print(self, job: bytes, pages: int, feed_mm: float, timeout: float = 120) -> dict:
-        """Send a whole job and wait for it to finish, without talking to the printer mid-job.
+    def print(self, job: bytes, pages: int, feed_mm: float, timeout: float = 120, confirm: bool = True) -> dict:
+        """Send one job, then wait until the printer has printed it.
 
-        Tape tests on the PT-E560BT: it sends no "printing completed" messages, and an
-        ESC i S sent while it was printing hung it until power-cycled. So: listen
-        passively for the estimated print time (~20 mm/s plus ~2 s per cut and ~4 s of
-        leader/cut at the end), then ask for status with the full preface, which is safe
-        once it's idle.
+        Tape tests on the PT-E560BT (NOTES.md): it sends no "printing completed" messages and the
+        status block doesn't change while printing, but it doesn't answer a bare ESC i S while it
+        is printing and answers again as soon as it's done. So we poll ESC i S (no ESC @: that
+        would initialize mid-job) every ~0.3 s: no answer = busy; an answer after being busy =
+        done. A reply with an error stops at once. The time estimate is only an upper limit.
+        `confirm` is kept for callers; polling is safe for chained jobs too (tested).
         """
         with _lock():
             d, out, inp = self._open()
@@ -176,29 +179,28 @@ class UsbDevice:
                 self._read(inp, 0.2)
                 for i in range(0, len(job), 4096):
                     out.write(job[i:i + 4096], timeout=10000)
-                kinds: list[str] = []
-                completed = 0
-                end = time.time() + 4 + feed_mm / 20 + 2 * pages
-                while time.time() < end:
-                    for st in self._read(inp, 1.0):
-                        kinds.append(st.kind)
-                        if st.kind == "error" or st.problems:
-                            raise UsbError("printer error: " + (", ".join(st.problems) or st.raw.hex()))
-                        completed += st.kind == "printing completed"
-                    if completed >= pages:
-                        return {"confirmed_by": "printing completed", "messages": kinds}
+                started = time.time()
+                limit = started + min(timeout, 15 + feed_mm / 5 + 4 * pages)     # generous upper bound
+                quiet_until = started + 3 + feed_mm / 15 + 2 * pages              # old estimate
+                busy, polls, last = False, 0, None
+                while time.time() < limit:
+                    out.write(b"\x1biS", timeout=2000)
+                    polls += 1
+                    got = self._read(inp, 0.6)
+                    if not got:
+                        busy = True
+                    else:
+                        last = got[-1]
+                        if last.kind == "error" or last.problems:
+                            raise UsbError("printer error: " + (", ".join(last.problems) or last.raw.hex()))
+                        # done: answered after being busy, or never went quiet and the estimate has passed
+                        if busy or time.time() > quiet_until:
+                            return {"confirmed_by": "status after busy" if busy else "status + estimate",
+                                    "seconds": round(time.time() - started, 1), "polls": polls}
+                    time.sleep(0.3)
+                raise UsbError(f"printer still busy after {time.time() - started:.0f} s")
             finally:
                 _release(d)
-        deadline = time.time() + timeout
-        while True:
-            st = self.status()
-            if st.problems:
-                raise UsbError("printer error after printing: " + ", ".join(st.problems))
-            if not st.printing:
-                return {"confirmed_by": "status idle", "messages": kinds}
-            if time.time() > deadline:
-                raise UsbError(f"printer still printing after {timeout:.0f} s")
-            time.sleep(2)
 
 
 def _release(d) -> None:

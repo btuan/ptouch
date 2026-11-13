@@ -9,44 +9,16 @@ from __future__ import annotations
 import base64
 import io
 import math
-import os
 from contextvars import ContextVar
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from . import device
+from . import device, fonts
 from .spec import QR, Barcode, DataMatrix, Image as ImageItem, Job, Label, Rule, Spacer, Text
 
 DPI = 360
-_SF = "/System/Library/Fonts/SFNS.ttf"          # variable font, wide glyph coverage (→ ✓ ° Ω)
-_SF_MONO = "/System/Library/Fonts/SFNSMono.ttf"
-# name -> (path, ttc index, variation name or None)
-if Path(_SF).exists():          # macOS: system fonts
-    FONTS = {
-        "sans": (_SF, 0, "Regular"),
-        "sans-medium": (_SF, 0, "Medium"),
-        "sans-bold": (_SF, 0, "Bold"),
-        "sans-light": (_SF, 0, "Light"),
-        "sans-condensed": (_SF, 0, "Condensed Regular"),
-        "sans-condensed-bold": (_SF, 0, "Condensed Bold"),
-        "mono": (_SF_MONO, 0, "Regular"),
-        "mono-bold": (_SF_MONO, 0, "Bold"),
-        "helvetica": ("/System/Library/Fonts/Helvetica.ttc", 0, None),
-        "helvetica-bold": ("/System/Library/Fonts/Helvetica.ttc", 1, None),
-    }
-else:                           # Linux / Docker: Inter, Roboto Condensed, DejaVu Sans Mono (Debian packages)
-    _D = os.environ.get("PTLABEL_FONT_DIR", "/usr/share/fonts")
-    _inter = lambda w: (f"{_D}/opentype/inter/Inter-{w}.otf", 0, None)
-    _cond = lambda w: (f"{_D}/truetype/roboto/unhinted/RobotoCondensed-{w}.ttf", 0, None)
-    _mono = lambda w: (f"{_D}/truetype/dejavu/DejaVuSansMono{w}.ttf", 0, None)
-    FONTS = {
-        "sans": _inter("Regular"), "sans-medium": _inter("Medium"),
-        "sans-bold": _inter("Bold"), "sans-light": _inter("Light"),
-        "sans-condensed": _cond("Regular"), "sans-condensed-bold": _cond("Bold"),
-        "mono": _mono(""), "mono-bold": _mono("-Bold"),
-        "helvetica": _inter("Regular"), "helvetica-bold": _inter("Bold"),
-    }
+FONTS = fonts.STYLES      # the only fonts labels use (bundled IBM Plex), same on every machine
 _NOTDEF = "\U000F0000"   # private-use codepoint: renders as the font's missing-glyph box
 # tape mm -> (tape width in dots, print-area offset from tape edge)   manual p.13
 TAPE_DOTS = {6: (84, 10), 9: (128, 11), 12: (170, 10), 18: (256, 11), 24: (340, 10), 36: (512, 29)}
@@ -69,23 +41,16 @@ def dpmm(scale: int = 1) -> float:
     return _dpi.get() / 25.4 * scale
 
 
-def _font(name: str, px: int) -> ImageFont.FreeTypeFont:
-    path, index, variation = FONTS.get(name, (name, 0, None))
+def _font(name: str, px: int, italic: bool = False) -> ImageFont.FreeTypeFont:
     try:
-        f = ImageFont.truetype(path, max(1, px), index=index)
-    except OSError as e:
-        raise RenderError(f"font not found: {name!r}; built-in names: {sorted(FONTS)}") from e
-    if variation:
-        try:
-            f.set_variation_by_name(variation)
-        except (OSError, ValueError):
-            pass
-    return f
+        return fonts.load(name, px, italic)
+    except KeyError:
+        raise RenderError(f"unknown font {name!r}; use one of: {', '.join(fonts.NAMES)}") from None
 
 
-def missing_glyphs(text: str, font: str) -> list[str]:
+def missing_glyphs(text: str, font: str, italic: bool = False) -> list[str]:
     """Characters the font would draw as a missing-glyph box."""
-    f = _font(font, 40)
+    f = _font(font, 40, italic)
     box = f.getmask(_NOTDEF)
     box_sig = (box.size, bytes(box))
     out = []
@@ -109,24 +74,49 @@ def _place(content: Image.Image, h: int) -> Image.Image:
 
 # ------------------------------------------------------------------ items
 
+def _text_layout(it: Text, px: int):
+    """Font, per-line draw positions (baseline-anchored), underline boxes, and the ink bbox.
+
+    Lines are laid out here rather than by Pillow's multiline drawing so underlines can
+    follow each line exactly: baselines are `line_spacing` em apart, lines aligned by
+    their advance width."""
+    f = _font(it.font, px, it.italic)
+    ascent, _ = f.getmetrics()
+    lines = it.text.split("\n")
+    widths = [f.getlength(line) for line in lines]
+    full = max(widths)
+    step = round(px * it.line_spacing)
+    probe = ImageDraw.Draw(_canvas(1, 1))
+    ops, unders, box = [], [], None
+    for i, (line, w) in enumerate(zip(lines, widths)):
+        x = {"left": 0, "center": (full - w) / 2, "right": full - w}[it.align]
+        y = ascent + i * step
+        ops.append((x, y, line))
+        parts = [probe.textbbox((x, y), line, font=f, anchor="ls")] if line.strip() else []
+        if it.underline and line.strip():
+            thick = max(1, round(px * 0.06))
+            top = y + max(1, round(px * 0.1))
+            u = (x, top, x + w, top + thick)
+            unders.append(u)
+            parts.append(u)
+        for l, t, r, b in parts:
+            box = (l, t, r, b) if box is None else (min(box[0], l), min(box[1], t), max(box[2], r), max(box[3], b))
+    if box is None:
+        box = (0, 0, 1, 1)
+    box = (math.floor(box[0]), math.floor(box[1]), math.ceil(box[2]), math.ceil(box[3]))
+    return f, ops, unders, box
+
+
 def _text(it: Text, h: int, s: int) -> Image.Image:
-    if missing := missing_glyphs(it.text, it.font):
+    if missing := missing_glyphs(it.text, it.font, it.italic):
         raise RenderError(f"font {it.font!r} has no glyph for {''.join(missing)!r}; "
-                          "try font 'sans' or 'mono'")
+                          "use plain characters, or an image item for symbols")
     avail_h = int(h * it.height_pct / 100)
     max_w = int(it.max_width_mm * dpmm(s)) if it.max_width_mm else None
-    probe = ImageDraw.Draw(_canvas(1, 1))
-
-    def measure(px):
-        f = _font(it.font, px)
-        bb = probe.multiline_textbbox((0, 0), it.text, font=f, align=it.align,
-                                      spacing=int(px * (it.line_spacing - 1)))
-        # Pillow can return fractional bounds (e.g. centred multi-line text on Linux)
-        return f, (math.floor(bb[0]), math.floor(bb[1]), math.ceil(bb[2]), math.ceil(bb[3]))
 
     def fits(px):
         try:
-            _, (l, t, r, b) = measure(px)
+            *_, (l, t, r, b) = _text_layout(it, px)
         except OSError:          # Pillow 13 FreeType raises on very small sizes
             return False
         return b - t <= avail_h and (max_w is None or r - l <= max_w)
@@ -143,10 +133,13 @@ def _text(it: Text, h: int, s: int) -> Image.Image:
             mid = (lo + hi + 1) // 2
             lo, hi = (mid, hi) if fits(mid) else (lo, mid - 1)
         px = lo
-    f, (l, t, r, b) = measure(px)
+    f, ops, unders, (l, t, r, b) = _text_layout(it, px)
     img = _canvas(r - l, b - t)
-    ImageDraw.Draw(img).multiline_text((-l, -t), it.text, font=f, fill=BLACK, align=it.align,
-                                       spacing=int(px * (it.line_spacing - 1)))
+    d = ImageDraw.Draw(img)
+    for x, y, line in ops:
+        d.text((x - l, y - t), line, font=f, fill=BLACK, anchor="ls")
+    for x0, y0, x1, y1 in unders:
+        d.rectangle([x0 - l, y0 - t, x1 - l - 1, y1 - t - 1], fill=BLACK)
     return _place(img, h)
 
 
@@ -176,8 +169,16 @@ def _qr(it: QR, h: int, s: int) -> Image.Image:
 
 def _datamatrix(it: DataMatrix, h: int, s: int) -> Image.Image:
     from ppf.datamatrix import DataMatrix as DM
-    return _matrix(DM(it.data).matrix, it.quiet_modules, h, it.height_pct, s, "Data Matrix",
-                   it.min_module_mm)
+    if it.gs1:
+        from . import gs1
+        try:
+            dm = gs1.datamatrix(it.data)
+        except gs1.GS1Error as e:
+            raise RenderError(f"GS1: {e}") from e
+    else:
+        dm = DM(it.data)
+    return _matrix(dm.matrix, it.quiet_modules, h, it.height_pct, s,
+                   "GS1 DataMatrix" if it.gs1 else "Data Matrix", it.min_module_mm)
 
 
 def _barcode(it: Barcode, h: int, s: int) -> Image.Image:
@@ -290,7 +291,7 @@ def _render_label(label: Label, tape_mm: int, hires: bool, model: device.Model) 
         W = round(label.length_mm * dpmm(s))
         if content_w + 2 * pad > W:
             raise RenderError(f"content needs {(content_w + 2 * pad) / dpmm(s):.1f} mm "
-                              f"but length_mm is {label.length_mm}")
+                              f"but the label length is set to {label.length_mm} mm")
     else:
         W = content_w + 2 * pad
     free = W - 2 * pad - content_w
@@ -325,48 +326,113 @@ def label_spans_mm(images: list[Image.Image], hires: bool, margin_mm: float,
 
 
 def render_job(job: Job, tape_mm: int, model: device.Model = device.P950NW) -> list[Image.Image]:
-    out = []
+    one_set = []
     for i, l in enumerate(job.labels):
         try:
-            img = render_label(l, tape_mm, job.hires, model)
+            one_set.append(render_label(l, tape_mm, job.hires, model))
         except RenderError as e:
             raise RenderError(str(e), ["labels", i, *e.loc]) from e
-        out += [img] * job.copies
-    return out
+    return one_set * job.copies          # whole sets, like Job.expanded_labels()
 
 
 # ------------------------------------------------------------------ preview
 
-def preview(images: list[Image.Image], tape_mm: int, hires: bool = False,
-            separator: str = "half_cut", margin_mm: float = 1.0, scale: int = 2,
-            frame: bool = True, model: device.Model = device.P950NW) -> Image.Image:
-    """Human-viewable RGB preview: labels on a strip of tape with cut marks.
+TAPE, TAPE_ALT = (250, 250, 247), (238, 240, 233)
+HALF_CUT, FULL_CUT = (90, 90, 96), (214, 48, 40)
 
-    Drawn at the printer's dpi; 180 dpi printers are shown at double scale so a
-    preview is the same physical size for every model."""
+
+def _tape_geometry(tape_mm: int, model: device.Model) -> tuple[int, int, int]:
+    """(tape height in dots, print-area offset, preview scale factor vs 360 dpi)."""
     if model.dpi == DPI:
         tape_h, off = TAPE_DOTS[tape_mm]
-    else:
-        tape_h = round(tape_mm * model.dpi / 25.4)
-        off = max(0, (tape_h - model.tape[tape_mm][0]) // 2)
-        tape_h = max(tape_h, model.tape[tape_mm][0])
-        scale = scale * DPI // model.dpi
+        return tape_h, off, 1
+    tape_h = round(tape_mm * model.dpi / 25.4)
+    off = max(0, (tape_h - model.tape[tape_mm][0]) // 2)
+    return max(tape_h, model.tape[tape_mm][0]), off, DPI // model.dpi
+
+
+def preview_layout(images: list[Image.Image], tape_mm: int, hires: bool = False,
+                   separator: str | list[str] = "half_cut", margin_mm: float = 1.0,
+                   model: device.Model = device.P950NW):
+    """Where each label goes in the preview (unscaled dots). A full cut starts a new row,
+    so the preview shows the separate pieces that come out of the printer.
+    Returns (width, height, rows of [(label index, x)], per-gap cut list, tape_h, off, m, gap)."""
+    tape_h, off, _ = _tape_geometry(tape_mm, model)
     m = round(margin_mm * model.dpi / 25.4)
+    n = len(images)
+    cuts = [separator] * max(0, n - 1) if isinstance(separator, str) else list(separator)[:max(0, n - 1)]
+    widths = [(im.width // 2 if hires else im.width) + 2 * m for im in images]
+    rows, x = [[]], 0
+    for i, w in enumerate(widths):
+        rows[-1].append((i, x))
+        x += w
+        if i < len(cuts) and cuts[i] == "full_cut":
+            rows.append([])
+            x = 0
+    rows = [r for r in rows if r]
+    gap = round(4 * model.dpi / 25.4)       # 4 mm between pieces
+    W = max(sum(widths[i] for i, _ in r) for r in rows) if rows else 1
+    H = len(rows) * tape_h + (len(rows) - 1) * gap
+    return W, H, rows, cuts, widths, tape_h, off, m, gap
+
+
+def label_boxes(images, tape_mm, hires=False, separator="half_cut", margin_mm=1.0,
+                model: device.Model = device.P950NW) -> list[tuple[float, float, float, float]]:
+    """Each label's box in the preview as fractions of its width/height (frame=False),
+    for highlighting in the UI."""
+    W, H, rows, _, widths, tape_h, _, _, gap = preview_layout(images, tape_mm, hires, separator, margin_mm, model)
+    boxes = [None] * len(images)
+    for r, row in enumerate(rows):
+        y = r * (tape_h + gap)
+        for i, x in row:
+            boxes[i] = (round(x / W, 5), round(y / H, 5), round((x + widths[i]) / W, 5), round((y + tape_h) / H, 5))
+    return boxes
+
+
+def preview(images: list[Image.Image], tape_mm: int, hires: bool = False,
+            separator: str | list[str] = "half_cut", margin_mm: float = 1.0, scale: int = 2,
+            frame: bool = True, model: device.Model = device.P950NW, end_cut: bool = False) -> Image.Image:
+    """Human-viewable preview: labels on tape with cut marks; a full cut starts a new row.
+
+    `separator` is one cut kind for every gap, or a list (one per gap, see
+    printer.cuts_between). `end_cut` marks the full cut after the last label (the job's end
+    cut, unless chain printing). Drawn at the printer's dpi; 180 dpi printers are shown at double
+    scale so a preview is the same physical size for every model. Without `frame`, the
+    space between rows is transparent."""
+    W, H, rows, cuts, widths, tape_h, off, m, gap = preview_layout(images, tape_mm, hires, separator,
+                                                                   margin_mm, model)
+    scale *= _tape_geometry(tape_mm, model)[2]
     imgs = [i.resize((i.width // 2, i.height)) if hires else i for i in images]
-    W = sum(i.width + 2 * m for i in imgs)
-    strip = Image.new("RGB", (W, tape_h), (250, 250, 247))
-    d = ImageDraw.Draw(strip)
-    x = 0
-    for n, im in enumerate(imgs):
-        strip.paste(im.convert("RGB"), (x + m, off))
-        x += im.width + 2 * m
-        if n < len(imgs) - 1 and separator != "none":
-            color = (220, 60, 60) if separator == "full_cut" else (120, 120, 120)
-            for y in range(0, tape_h, 6):
-                d.line([(x, y), (x, y + 3)], fill=color)
+    sheet = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    t = max(2, tape_h // 14)              # cut-mark notch size
+    for r, row in enumerate(rows):
+        y0 = r * (tape_h + gap)
+        row_w = sum(widths[i] for i, _ in row)
+        strip = Image.new("RGB", (row_w, tape_h), TAPE)
+        d = ImageDraw.Draw(strip)
+        for i, x in row:
+            if i % 2:                     # alternate a faint tint so label boundaries read at a glance
+                d.rectangle([x, 0, x + widths[i] - 1, tape_h - 1], fill=TAPE_ALT)
+            ink = ImageOps.invert(imgs[i].convert("L"))       # paste only the black dots, keep the tint
+            strip.paste((0, 0, 0), (x + m, off), mask=ink)
+        for i, x in row[:-1]:             # cuts inside a row: half-cuts (dashed) only; "none" = nothing
+            if cuts[i] == "half_cut":
+                cx = x + widths[i]
+                for y in range(0, tape_h, 6):
+                    d.line([(cx, y), (cx, min(tape_h - 1, y + 3))], fill=HALF_CUT)
+                d.line([(cx - t // 2, 0), (cx + t // 2, 0)], fill=HALF_CUT)
+                d.line([(cx - t // 2, tape_h - 1), (cx + t // 2, tape_h - 1)], fill=HALF_CUT)
+        last = row[-1][0]
+        if (last < len(cuts) and cuts[last] == "full_cut") or (end_cut and last == len(images) - 1):
+            # this piece is cut off here (or the job's end cut): red notches
+            cx = row_w - 1
+            d.line([(cx, 0), (cx, tape_h - 1)], fill=FULL_CUT, width=1)
+            d.polygon([(cx - t, 0), (cx, 0), (cx, t)], fill=FULL_CUT)
+            d.polygon([(cx - t, tape_h - 1), (cx, tape_h - 1), (cx, tape_h - 1 - t)], fill=FULL_CUT)
+        sheet.paste(strip, (0, y0))
     if not frame:
-        return strip.resize((strip.width * scale, strip.height * scale), Image.Resampling.NEAREST)
+        return sheet.resize((W * scale, H * scale), Image.Resampling.NEAREST)
     pad = 12
-    out = Image.new("RGB", (W + 2 * pad, tape_h + 2 * pad), (230, 230, 235))
-    out.paste(strip, (pad, pad))
+    out = Image.new("RGB", (W + 2 * pad, H + 2 * pad), (230, 230, 235))
+    out.paste(sheet, (pad, pad), sheet)
     return out.resize((out.width * scale, out.height * scale), Image.Resampling.NEAREST)
